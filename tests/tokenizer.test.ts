@@ -13,6 +13,11 @@ import {
   TokenizerError,
   translatePretokenizerRegex,
 } from '../src/tokenizer/bpe.js';
+import {
+  ChatTemplate,
+  ChatTemplateError,
+  loadChatTemplate,
+} from '../src/tokenizer/chat_template.js';
 
 import golden from './fixtures/tokenizer-golden.json';
 
@@ -133,5 +138,94 @@ describe('tokenizer vs Python golden pairs', () => {
     if (!tokenizer) return;
     const ids = tokenizer.encode('<|im_start|>user\nHello<|im_end|>');
     expect(tokenizer.decode(ids, { skipSpecialTokens: true })).toBe('user\nHello');
+  });
+});
+
+describe('chat template', () => {
+  let template: ChatTemplate | null = null;
+
+  beforeAll(async () => {
+    const url = new URL('/models/qwen2.5-0.5b-instruct/tokenizer_config.json', location.href).href;
+    if (!(await fetch(url, { method: 'HEAD' })).ok) return;
+    template = (await loadChatTemplate(url)).template;
+  });
+
+  it('reproduces every golden rendering exactly', () => {
+    if (!template) return;
+    for (const testCase of golden.chatCases) {
+      const rendered = template.render(testCase.messages, {
+        addGenerationPrompt: testCase.addGenerationPrompt,
+      });
+      if (rendered !== testCase.rendered) {
+        throw new Error(
+          `${testCase.name} mismatch:\n  expected ${JSON.stringify(testCase.rendered)}\n` +
+            `  got      ${JSON.stringify(rendered)}`,
+        );
+      }
+    }
+    console.log(
+      `chat template: ${golden.chatCases.length}/${golden.chatCases.length} renderings exact`,
+    );
+  });
+
+  it('injects the model default system prompt when none is supplied', () => {
+    if (!template) return;
+    // Easy to miss and it changes every token that follows, so it is pinned explicitly.
+    const rendered = template.render([{ role: 'user', content: 'Hello' }], {
+      addGenerationPrompt: true,
+    });
+    expect(rendered).toContain('You are Qwen, created by Alibaba Cloud.');
+    expect(rendered.endsWith('<|im_start|>assistant\n')).toBe(true);
+  });
+
+  it('omits the generation prompt when not asked for', () => {
+    if (!template) return;
+    const rendered = template.render([{ role: 'user', content: 'Hello' }], {
+      addGenerationPrompt: false,
+    });
+    expect(rendered.endsWith('<|im_start|>assistant\n')).toBe(false);
+  });
+
+  it('tokenizes its own rendering to the golden ids', () => {
+    if (!template || !tokenizer) return;
+    for (const testCase of golden.chatCases) {
+      const rendered = template.render(testCase.messages, {
+        addGenerationPrompt: testCase.addGenerationPrompt,
+      });
+      expect(tokenizer.encode(rendered), testCase.name).toEqual(testCase.ids);
+    }
+  });
+
+  it('evaluates the expression subset it claims to support', () => {
+    const cases: Array<[string, string]> = [
+      ["{{ 'a' + 'b' }}", 'ab'],
+      ['{% if 1 == 1 %}yes{% else %}no{% endif %}', 'yes'],
+      ['{% if 1 != 1 %}yes{% elif 2 > 1 %}elif{% else %}no{% endif %}', 'elif'],
+      ['{% for x in items %}{{ x }}{% if not loop.last %},{% endif %}{% endfor %}', '1,2,3'],
+      ['{% for x in items %}{{ loop.index0 }}{% endfor %}', '012'],
+      ['{% set y = 5 %}{{ y }}', '5'],
+      ['{{ missing is defined }}', 'False'],
+      ['{{ items is defined }}', 'True'],
+      ['{{ obj.name }}', 'qwen'],
+      ["{{ obj['name'] }}", 'qwen'],
+      ['{{ items | length }}', '3'],
+      ["{{ ' pad ' | trim }}", 'pad'],
+      ['{{ obj | tojson }}', '{"name":"qwen"}'],
+      ["{% if 'a' in letters %}in{% endif %}", 'in'],
+    ];
+    for (const [source, expected] of cases) {
+      const result = new ChatTemplate(source).render([], {
+        extra: { items: [1, 2, 3], obj: { name: 'qwen' }, letters: ['a', 'b'] },
+      });
+      expect(result, source).toBe(expected);
+    }
+  });
+
+  it('refuses a construct it does not implement rather than rendering it wrong', () => {
+    // A chat template that renders almost-right produces a prompt the model was never
+    // trained on, and that is very hard to notice downstream.
+    expect(() => new ChatTemplate('{% macro f() %}{% endmacro %}')).toThrow(ChatTemplateError);
+    expect(() => new ChatTemplate('{{ x | nosuchfilter }}').render([])).toThrow(ChatTemplateError);
+    expect(() => new ChatTemplate('{{ x is weird }}').render([])).toThrow(ChatTemplateError);
   });
 });

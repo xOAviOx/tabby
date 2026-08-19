@@ -95,6 +95,51 @@ CHAT_MESSAGES = [
     {"role": "user", "content": "Why?"},
 ]
 
+# Conversation shapes the template renderer has to reproduce exactly. The no-system case
+# matters most: this template injects a default system prompt when none is supplied, which
+# is easy to miss and changes every token that follows.
+CHAT_CASES: list[tuple[str, list[dict], bool]] = [
+    ("single-user", [{"role": "user", "content": "Hello"}], True),
+    ("single-user-no-gen", [{"role": "user", "content": "Hello"}], False),
+    (
+        "with-system",
+        [
+            {"role": "system", "content": "You are terse."},
+            {"role": "user", "content": "Define entropy."},
+        ],
+        True,
+    ),
+    (
+        "multi-turn",
+        [
+            {"role": "system", "content": "You are a helpful assistant."},
+            {"role": "user", "content": "What is 2 + 2?"},
+            {"role": "assistant", "content": "4."},
+            {"role": "user", "content": "Why?"},
+        ],
+        True,
+    ),
+    (
+        "multi-turn-no-system",
+        [
+            {"role": "user", "content": "Hi"},
+            {"role": "assistant", "content": "Hello! How can I help?"},
+            {"role": "user", "content": "Tell me a joke."},
+        ],
+        True,
+    ),
+    (
+        "unicode-content",
+        [{"role": "user", "content": "Translate 你好 and café \U0001f30d"}],
+        True,
+    ),
+    (
+        "multiline-content",
+        [{"role": "user", "content": "line one\nline two\n\nline four"}],
+        True,
+    ),
+]
+
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -124,10 +169,27 @@ def main(argv: list[str] | None = None) -> int:
         "ids": tok.encode(rendered, add_special_tokens=False),
     }
 
+    chat_cases = []
+    for name, messages, add_generation in CHAT_CASES:
+        text = tok.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=add_generation
+        )
+        chat_cases.append(
+            {
+                "name": name,
+                "messages": messages,
+                "addGenerationPrompt": add_generation,
+                "rendered": text,
+                "ids": tok.encode(text, add_special_tokens=False),
+            }
+        )
+
     fixture = {
         "modelDir": str(args.model_dir),
         "pairs": pairs,
         "chat": chat,
+        "chatCases": chat_cases,
+        "chatTemplate": tok.chat_template,
         "specialTokens": {
             "bos": tok.bos_token_id,
             "eos": tok.eos_token_id,
@@ -140,6 +202,7 @@ def main(argv: list[str] | None = None) -> int:
 
     total_ids = sum(len(p["ids"]) for p in pairs)
     print(f"wrote {len(pairs)} golden pairs ({total_ids} ids total) to {args.out}")
+    print(f"  plus {len(chat_cases)} chat-template renderings")
     mismatched = [p["name"] for p in pairs if p["decoded"] != p["text"]]
     if mismatched:
         # Not an error: some inputs genuinely do not survive a round trip (NFC folding,
