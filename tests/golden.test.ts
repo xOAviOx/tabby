@@ -82,7 +82,7 @@ beforeAll(async () => {
   tokenizer = await BpeTokenizer.fromUrl(new URL('tokenizer.json', MODEL_BASE).href);
   model = await loadModel(ctx.device, { baseUrl: MODEL_BASE, modelId: `${MODEL_ID}-golden` });
   forward = await ForwardPass.create(ctx.device, model, new PipelineCache(ctx.device), {
-    maxTokens: 128,
+    maxSeqLen: 128,
   });
 }, 300_000);
 
@@ -105,7 +105,7 @@ describe('M2 gate: forward pass vs PyTorch goldens', () => {
 
     let worstOverall = 0;
     for (const prompt of manifest.prompts) {
-      const result = await forward.run(prompt.ids, { captureActivations: true });
+      const result = await forward.runFull(prompt.ids, { captureActivations: true });
       expect(result.activations).not.toBeNull();
       const activations = result.activations!;
 
@@ -159,7 +159,7 @@ describe('M2 gate: forward pass vs PyTorch goldens', () => {
     if (!manifest || !forward || !tokenizer) return;
 
     for (const prompt of manifest.prompts) {
-      const { logits } = await forward.run(prompt.ids);
+      const { logits } = await forward.runFull(prompt.ids);
       const ours = topK(logits, 5);
       const ids = ours.map((entry) => entry.id);
 
@@ -178,7 +178,7 @@ describe('M2 gate: forward pass vs PyTorch goldens', () => {
     for (const prompt of manifest.prompts) {
       const result = await generateGreedy(
         prompt.ids,
-        async (ids) => (await forward!.run(ids)).logits,
+        async (ids) => (await forward!.runFull(ids)).logits,
         { maxNewTokens: prompt.greedy.ids.length },
       );
       const text = tokenizer.decode(result.tokens);
