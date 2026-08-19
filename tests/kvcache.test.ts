@@ -13,7 +13,7 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { requestGpuContext, type GpuContext } from '../src/engine/device.js';
 import { PipelineCache } from '../src/engine/pipelines.js';
 import { loadModel, type LoadedModel } from '../src/engine/model.js';
-import { ForwardPass } from '../src/engine/forward.js';
+import { ForwardPass, requireLogits } from '../src/engine/forward.js';
 import { ContextOverflowError, KvCache } from '../src/engine/kvcache.js';
 import { BpeTokenizer } from '../src/tokenizer/bpe.js';
 import { argmax } from '../src/engine/sampler.js';
@@ -109,7 +109,7 @@ describe('M3 gate: cached decode vs full recomputation', () => {
     const fullTokens: number[] = [];
     const fullLogits: Float32Array[] = [];
     for (let step = 0; step < newTokens; step++) {
-      const { logits } = await forward.runFull(sequence);
+      const logits = requireLogits(await forward.runFull(sequence));
       fullLogits.push(logits);
       const next = argmax(logits);
       fullTokens.push(next);
@@ -124,13 +124,13 @@ describe('M3 gate: cached decode vs full recomputation', () => {
     const prefillStart = performance.now();
     const prefilled = await forward.prefill(promptIds);
     const ttftMs = performance.now() - prefillStart;
-    cachedLogits.push(prefilled.logits);
-    let next = argmax(prefilled.logits);
+    cachedLogits.push(requireLogits(prefilled));
+    let next = argmax(requireLogits(prefilled));
     cachedTokens.push(next);
 
     const decodeStart = performance.now();
     for (let step = 1; step < newTokens; step++) {
-      const logits = await forward.decode(next);
+      const logits = requireLogits(await forward.decode(next));
       cachedLogits.push(logits);
       next = argmax(logits);
       cachedTokens.push(next);
@@ -176,16 +176,15 @@ describe('M3 gate: cached decode vs full recomputation', () => {
     const sequence = [...promptIds];
     const noCacheStart = performance.now();
     for (let step = 0; step < steps; step++) {
-      const { logits } = await forward.runFull(sequence);
-      sequence.push(argmax(logits));
+      sequence.push(argmax(requireLogits(await forward.runFull(sequence))));
     }
     const noCacheMs = performance.now() - noCacheStart;
 
     forward.reset();
     const cachedStart = performance.now();
-    let next = argmax((await forward.prefill(promptIds)).logits);
+    let next = argmax(requireLogits(await forward.prefill(promptIds)));
     for (let step = 1; step < steps; step++) {
-      next = argmax(await forward.decode(next));
+      next = argmax(requireLogits(await forward.decode(next)));
     }
     const cachedMs = performance.now() - cachedStart;
 
@@ -250,7 +249,7 @@ describe('tiled prefill matmul', () => {
         let logits: Float32Array<ArrayBufferLike> = new Float32Array(0);
         for (let i = 0; i < 3; i++) {
           const started = performance.now();
-          logits = (await pass.runFull(ids)).logits;
+          logits = requireLogits(await pass.runFull(ids));
           runs.push(performance.now() - started);
         }
         variants.push({

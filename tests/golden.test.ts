@@ -16,7 +16,7 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { requestGpuContext, type GpuContext } from '../src/engine/device.js';
 import { PipelineCache } from '../src/engine/pipelines.js';
 import { loadModel, type LoadedModel } from '../src/engine/model.js';
-import { ForwardPass } from '../src/engine/forward.js';
+import { ForwardPass, requireLogits } from '../src/engine/forward.js';
 import { BpeTokenizer } from '../src/tokenizer/bpe.js';
 import { generateGreedy, topK } from '../src/engine/sampler.js';
 import { errorStats, fmt } from './support.js';
@@ -159,7 +159,7 @@ describe('M2 gate: forward pass vs PyTorch goldens', () => {
     if (!manifest || !forward || !tokenizer) return;
 
     for (const prompt of manifest.prompts) {
-      const { logits } = await forward.runFull(prompt.ids);
+      const logits = requireLogits(await forward.runFull(prompt.ids));
       const ours = topK(logits, 5);
       const ids = ours.map((entry) => entry.id);
 
@@ -178,7 +178,7 @@ describe('M2 gate: forward pass vs PyTorch goldens', () => {
     for (const prompt of manifest.prompts) {
       const result = await generateGreedy(
         prompt.ids,
-        async (ids) => (await forward!.runFull(ids)).logits,
+        async (ids) => requireLogits(await forward!.runFull(ids)),
         { maxNewTokens: prompt.greedy.ids.length },
       );
       const text = tokenizer.decode(result.tokens);

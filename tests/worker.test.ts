@@ -9,6 +9,10 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
 import { InferenceClient, type LoadedInfo } from '../src/worker/client.js';
+import type { SamplingParams } from '../src/engine/sampler.js';
+
+/** Greedy, so these tests stay deterministic; sampling itself is gated in sampling.test.ts. */
+const GREEDY: SamplingParams = { temperature: 0, topK: 1, topP: 1, seed: 1 };
 
 const MODEL_ID = 'qwen2.5-0.5b-instruct';
 const MODEL_BASE = new URL(`/models/${MODEL_ID}/`, location.href).href;
@@ -65,6 +69,7 @@ describe('inference worker', () => {
     const handle = client.generate({
       prompt: 'The capital of France is',
       maxNewTokens: 12,
+      sampling: GREEDY,
       onToken: (text) => {
         chunks.push(text);
         arrivals.push(performance.now() - started);
@@ -93,6 +98,7 @@ describe('inference worker', () => {
     const handle = client.generate({
       prompt: 'Once upon a time in a distant land',
       maxNewTokens: 60,
+      sampling: GREEDY,
       onToken: (text) => {
         received.push(text);
         if (received.length === 4) {
@@ -116,7 +122,11 @@ describe('inference worker', () => {
     );
 
     // The client must be usable immediately afterwards.
-    const after = client.generate({ prompt: 'Two plus two is', maxNewTokens: 3 });
+    const after = client.generate({
+      prompt: 'Two plus two is',
+      maxNewTokens: 3,
+      sampling: GREEDY,
+    });
     const afterStats = await after.done;
     expect(afterStats.cancelled).toBe(false);
     expect(afterStats.generatedTokens).toBe(3);
@@ -138,7 +148,11 @@ describe('inference worker', () => {
     }, 10);
 
     try {
-      const handle = client.generate({ prompt: 'Write a short story about', maxNewTokens: 16 });
+      const handle = client.generate({
+        prompt: 'Write a short story about',
+        maxNewTokens: 16,
+        sampling: GREEDY,
+      });
       const stats = await handle.done;
       clearInterval(timer);
 
@@ -161,6 +175,7 @@ describe('inference worker', () => {
     const handle = client.generate({
       prompt: 'a '.repeat(100),
       maxNewTokens: 200,
+      sampling: GREEDY,
     });
     await expect(handle.done).rejects.toThrow(/context overflow/i);
   }, 900_000);
