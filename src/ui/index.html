@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <link
+      rel="icon"
+      href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' rx='3' fill='%232b6cb0'/%3E%3Cpath d='M4 11V5h1.6l1.4 3 1.4-3H10v6H8.7V7.2L7.4 10H6.6L5.3 7.2V11z' fill='white'/%3E%3C/svg%3E"
+    />
+    <title>Browser LLM — WebGPU device</title>
+    <link rel="stylesheet" href="./style.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <header>
+        <h1>Browser LLM</h1>
+        <p class="sub">Transformer inference on WebGPU, hand-written WGSL. Milestone M0.</p>
+      </header>
+
+      <section id="status" class="card" aria-live="polite">
+        <p class="muted">Requesting adapter…</p>
+      </section>
+
+      <section id="adapter" class="card" hidden>
+        <h2>Adapter</h2>
+        <dl id="adapter-body" class="kv"></dl>
+      </section>
+
+      <section id="limits" class="card" hidden>
+        <h2>Negotiated limits</h2>
+        <p class="muted">
+          These are the granted values, not the defaults we asked to exceed. Tensor
+          sharding in M1 is sized against <code>maxStorageBufferBindingSize</code>.
+        </p>
+        <dl id="limits-body" class="kv"></dl>
+      </section>
+
+      <section id="selfcheck" class="card" hidden>
+        <h2>Kernel self-check</h2>
+        <p class="muted">
+          <code>matvec_f32</code> run on this GPU and compared against the scalar CPU
+          reference, same as <code>npm test</code>.
+        </p>
+        <table id="selfcheck-body"></table>
+      </section>
+    </main>
+    <script type="module" src="./main.ts"></script>
+  </body>
+</html>
