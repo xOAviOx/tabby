@@ -1,6 +1,6 @@
 # PROGRESS
 
-## Current milestone: M0 — complete. M1 not started.
+## Current milestone: M1 — complete. M2 not started.
 
 ## Device limits negotiated on Apple M-series (`apple` / `metal-3`), Chromium 151 headless
 
@@ -103,6 +103,76 @@ These are dominated by allocation and synchronisation, not by arithmetic. They a
 meaningful kernel benchmark and should not be quoted anywhere; the real baseline is M2's
 end-to-end tok/s.
 
+### M1 — passed 2026-08-19
+
+`npm test` -> 39 passed across 3 files. The M1 gate lives in `tests/weights.qwen.test.ts`
+and runs against the real converted model; `tests/weights.test.ts` covers the same loader
+paths against a few-KB synthetic model so they stay fast and machine-independent.
+
+**Conversion.** `tools/convert.py` on Qwen2.5-0.5B-Instruct: 290 tensors, 494.0M params,
+30 chunks, 988.2 MB (942 MiB), 3.4 s. No f16 overflow. `tie_word_embeddings` is true, so
+`lm_head.weight` is stored once and aliased to `model.embed_tokens.weight`.
+
+**Load timings** (Chromium 151 headless, localhost dev server, warm page):
+
+| | fetch | GPU upload | total |
+|---|---|---|---|
+| cold (network) | 3654 ms | 682 ms | 4341 ms |
+| warm (OPFS) | **5 ms** | 556 ms | 562 ms |
+
+761x on the fetch phase. The warm path reads zero bytes from the network — asserted,
+not just observed — and a further test replaces `globalThis.fetch` with a function that
+throws, proving the cached load is genuinely offline rather than merely cache-preferring.
+
+**Byte-match gate.** Three tensors read back off the GPU, concatenated across shards,
+hashed in the page, and compared with sha256 computed in Python directly from
+`model.safetensors`. Chosen to cover different cases, not three of the same thing:
+
+| tensor | shape | dtype | size | result |
+|---|---|---|---|---|
+| `model.embed_tokens.weight` | 151936 x 896 | f16 | 259.66 MiB | MATCH |
+| `model.layers.0.self_attn.q_proj.bias` | 896 | f32 | 3.5 KiB | MATCH |
+| `model.norm.weight` | 896 | f32 | 3.5 KiB | MATCH |
+
+**Sharding (blocker B1, now closed).** The threshold is an injectable option rather than
+a direct read of `device.limits`, so the multi-shard path runs on every machine. At a
+64 MiB threshold the embedding matrix splits into 5 shards, row-aligned, and the
+concatenation still hashes identically. The tiny-model test forces a 2048-byte threshold
+and gets 7 shards. Rows are asserted contiguous, complete, and non-overlapping.
+
+**Progress reporting.** Byte counts are real: the download phase reports actual bytes
+from the response stream and the upload phase reports actual bytes written to GPU
+buffers, both against `header.totalBytes`. Tests assert the sequence is monotonic and
+ends exactly on the total. The dev page shows both phases.
+
+**On the dtype split.** Rank-2 weights are f16; rank-1 tensors (RMSNorm gains, Qwen's
+q/k/v biases) stay f32. They are 0.03% of the file, and M5 explicitly says to keep norms
+and biases in high precision, so narrowing them would cost accuracy for nothing.
+
+## What M1 cost, and the two bugs worth remembering
+
+**The quadratic OPFS write.** The first working loader took over 120 s to load 942 MiB and
+timed out. `ensureChunk` opened a `createWritable({ keepExistingData: true })` for every
+packet off the network stream. That call copies the entire existing file into a swap file
+when it opens, so a 32 MB chunk arriving in ~16 KB packets did on the order of tens of GB
+of copying. One writable per chunk, streamed into, took the cold load to 4.3 s — a ~28x
+improvement that was entirely a bug fix, not an optimisation.
+
+**The storage quota that was really a memory limit.** After that, the gate failed
+intermittently with `QuotaExceededError` — passing alone, failing in the full suite, then
+failing about two runs in three. The reported quota varied run to run between 3072 and
+4096 MiB while usage never exceeded 942 MiB, which is what finally gave it away:
+Playwright's default *ephemeral* browser context keeps OPFS in memory and sizes its quota
+from free RAM. Switching the provider to `persistentContext: true` puts OPFS on disk; the
+quota became a stable 10240 MiB and three consecutive full runs passed.
+
+Worth recording because the first instinct was wrong twice. I initially assumed the `.part`
+file plus `move()` plus swap files were tripling storage, rewrote the download path to
+write directly to the final name with a `verified.json` manifest, and the failure persisted.
+A direct measurement then showed writes were exactly 1.00x — the rewrite was not what
+fixed it. It is a genuine improvement (one copy instead of three, and warm loads no longer
+re-hash a gigabyte) and it stays, but the actual fix was the browser context.
+
 ## Optimization log
 
 Empty by design — no kernel may be optimised before it has passed a numerical gate, and
@@ -114,26 +184,23 @@ M0's matvec is the naive reference shape that M5's optimised kernel must reprodu
 
 ## Blockers
 
-None blocking M1. Two findings that change the design of later milestones:
+None. B1 is closed; B2 is still open and still shapes M2/M5.
 
-**B1 — this machine cannot validate tensor sharding.**
-`maxStorageBufferBindingSize` here is 4 GiB, 32× the 128 MiB spec default. Qwen2.5-0.5B's
-`lm_head` (151,936 × 896 fp16 ≈ 272 MB) therefore fits in a single buffer *on this machine
-only*; on a default-limit device it does not. If M1's sharding path is only exercised
-against real limits, it will never execute here and will break on the first reviewer's
-laptop. Plan: make the shard threshold an injectable value rather than reading
-`device.limits` directly, and have the M1 test force a small synthetic threshold (e.g.
-1 MiB) so the multi-shard path is covered on every machine. `buffers.ts` already routes all
-size checks through one `assertFitsLimits` function so there is a single place to inject.
+**B1 — CLOSED.** Tensor sharding could not be validated on this machine, whose
+`maxStorageBufferBindingSize` is 4 GiB. Fixed as planned: `loadModel` takes an optional
+`shardThresholdBytes` that overrides the device limit, and tests force small thresholds
+(2048 bytes on the synthetic model, 64 MiB on Qwen) so the multi-shard path executes
+everywhere. Shard bytes are verified identical to the unsharded source.
 
-**B2 — `maxComputeWorkgroupsPerDimension` is 65,535, and the vocab is 151,936.**
+**B2 — still open. `maxComputeWorkgroupsPerDimension` is 65,535, and the vocab is 151,936.**
 M5 prescribes "one workgroup per output row" for the quantized matvec. For `lm_head` that
-is 151,936 workgroups in X — 2.3× over the limit, and this limit is *at the spec default*,
-so no adapter will save us. Every output-row-per-workgroup kernel needs either a 2D dispatch
-or a rows-per-workgroup factor from the start. Cheap if designed in at M2, expensive if
-retrofitted at M5. Recorded now so it is not rediscovered later.
+is 151,936 workgroups in X, 2.3x over the limit, and the limit is at the spec default so
+no adapter will lift it. Every output-row-per-workgroup kernel needs a 2D dispatch or a
+rows-per-workgroup factor. Cheap to design in at M2, expensive to retrofit at M5.
+See open question 2 — this is the one decision I would like settled before M2 starts.
 
-Neither of these is a reason to pause; both are noted so M1/M2 are built with them in mind.
+**Not a blocker, but sized now:** at fp16 the model is 942 MiB of VRAM and a 942 MiB
+download. That is the M5 quantization case making itself, not a problem with M1.
 
 ## Deviations from PROJECT.md, for the record
 
@@ -146,6 +213,17 @@ Neither of these is a reason to pause; both are noted so M1/M2 are built with th
   construction, uniform packing and dispatch sizing — the seam between `/src/shaders/*.wgsl`
   and `forward.ts`. Expect it to become a directory once M2 adds ten more kernels.
 - **`tests/support.ts`** — seeded PRNG and error metrics shared across test files.
+- **`src/engine/store.ts`** is not in PROJECT.md's layout. It holds OPFS persistence,
+  ranged download with resume, sha256 verification, and the chunk-spanning byte reader.
+  `model.ts` keeps header parsing, the weight registry and GPU upload, as specified;
+  putting transport in there too would have made it the largest file in the project.
+- **`tools/make_test_model.py`** and **`tools/dump_expected.py`** are additions to the
+  prescribed `tools/` set: the first generates the tiny synthetic model, the second emits
+  the expected-bytes fixture the gate compares against.
+- **Python dependencies: numpy only.** `safetensors` is on the approved list but is not
+  used — its numpy API cannot return BF16 tensors at all, and Qwen2.5 ships BF16, so the
+  widening had to be hand-written regardless. Parsing the container by hand costs ~40
+  lines. `torch` is still expected at M2 for golden dumps; see open question 3.
 
 ## Notes for whoever picks this up next
 
@@ -158,22 +236,44 @@ Neither of these is a reason to pause; both are noted so M1/M2 are built with th
 - WebGPU also requires a secure context with a real origin. `about:blank` does not expose
   `navigator.gpu` at all, which is a confusingly different symptom from the one above.
 - `npm run dev` serves a device panel at `/` showing the negotiated adapter, the full
-  granted limit set, and a live matvec self-check against the CPU reference — the fastest
-  way to characterise a new machine before benchmarking it.
+  granted limit set, a model loader with a real progress bar, and a live matvec self-check
+  against the CPU reference — the fastest way to characterise a new machine.
+- **Tests run one file at a time (`fileParallelism: false`) in a persistent browser
+  context.** Both settings are load-bearing for the M1 gate, for the storage reasons
+  described above. Do not turn either back on without re-reading that section.
+- **The converted model is gitignored** (~943 MiB). `tests/weights.qwen.test.ts` skips
+  itself with a warning when `public/models/qwen2.5-0.5b-instruct/model.json` is absent,
+  so a fresh clone still gets a green suite. Regenerate with:
+  ```
+  python3 tools/convert.py models/Qwen2.5-0.5B-Instruct \
+      --out public/models/qwen2.5-0.5b-instruct
+  python3 tools/dump_expected.py models/Qwen2.5-0.5B-Instruct \
+      --model-id qwen2.5-0.5b-instruct \
+      --out tests/fixtures/weights-qwen2.5-0.5b-instruct.json
+  ```
+  The tiny synthetic model *is* committed (~50 KB) so the fast loader tests always run:
+  regenerate with `python3 tools/make_test_model.py`.
+- `vite build` sets `copyPublicDir: false`. The weights live in `public/` so the dev
+  server and test runner can serve them over HTTP, but copying a gigabyte into `dist/` on
+  every build would be pointless. How weights reach the CDN is an M6 decision.
 
 ## Open questions for Avi
 
-1. **Confirm the f32/f64 reference split described above.** It is the one judgement call in
-   M0 that a reasonable person could make differently, and it sets the pattern for every
-   kernel gate from here on. The alternative — gate on f64 and widen the tolerance per
-   shape — is defensible but would have meant loosening a stated tolerance at M0, which §7
-   forbids.
-2. **B2 (workgroups-per-dimension vs vocab size).** Want me to design the 2D-dispatch
-   convention into M2's kernels from the start, or keep M2 strictly naive per the milestone
-   text and absorb the change at M5? Milestone text says naive; the limit says decide early.
-3. **Model source for M1.** Should `tools/convert.py` take a local HF snapshot directory you
-   have already downloaded, or should it fetch `Qwen/Qwen2.5-0.5B-Instruct` from the Hub
-   itself? The latter needs `huggingface_hub` in the Python toolchain — a dependency outside
-   the approved list, hence the question.
+1. **Confirm the f32/f64 reference split** described under M0. Unchanged from last
+   session; it sets the pattern for every kernel gate from here on.
+2. **B2 (workgroups-per-dimension vs vocab size) — I would like this settled before M2.**
+   My recommendation is to design the rows-per-workgroup factor in from the start. The
+   milestone text says naive, but 151,936 output rows against a 65,535 dispatch limit is
+   a correctness requirement rather than an optimisation, and no adapter will lift it.
+   Treating "naive" as "untiled, one thread per output" and still taking the 2D dispatch
+   costs a few lines at M2 and saves rewriting every matvec at M5.
+3. **`torch` on Python 3.14.** M2 needs `tools/golden.py` to dump PyTorch reference
+   activations, and this machine runs Python 3.14.4, which is newer than most PyTorch
+   wheels support. M1 did not need it (conversion is numpy-only). If torch will not
+   install, the fallback is a 3.12 virtualenv used only by `tools/`. Flagging before M2
+   rather than discovering it at the golden gate — want me to verify the install now?
 4. **Benchmark machines.** M6 needs the table measured on at least three. This Mac is one.
    What are the other two, and will I have access to run on them?
+5. **Should I push?** There are now local commits that have never been pushed. The
+   session hook has been pushing its own commits to `xOAviOx/tabby` unasked, but I have
+   not pushed mine.
