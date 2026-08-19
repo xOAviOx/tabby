@@ -12,6 +12,15 @@ import { BufferArena, readF32 } from './buffers.js';
 import { bindGroup, type PipelineCache } from './pipelines.js';
 import { withErrorScopes } from './device.js';
 import matvecF32Source from '../shaders/matvec_f32.wgsl?raw';
+import embedGatherSource from '../shaders/embed_gather.wgsl?raw';
+import rmsNormSource from '../shaders/rmsnorm.wgsl?raw';
+import matmulF16Source from '../shaders/matmul_f16.wgsl?raw';
+import ropeSource from '../shaders/rope.wgsl?raw';
+import attnScoresSource from '../shaders/attn_scores.wgsl?raw';
+import softmaxRowsSource from '../shaders/softmax_rows.wgsl?raw';
+import attnOutputSource from '../shaders/attn_output.wgsl?raw';
+import residualAddSource from '../shaders/residual_add.wgsl?raw';
+import siluMulSource from '../shaders/silu_mul.wgsl?raw';
 
 export const DEFAULT_MATVEC_WORKGROUP = 64;
 
@@ -109,4 +118,148 @@ export async function runMatvecF32(
   } finally {
     arena.destroy();
   }
+}
+
+// =======================================================================================
+// M2 kernels
+// =======================================================================================
+
+export const DEFAULT_WORKGROUP = 64;
+
+/**
+ * Uniform buffers are padded to 16 bytes. WGSL's uniform address space has stricter
+ * layout rules than storage and undersized bindings are a common backend-specific
+ * validation failure, so every packer here rounds up rather than sizing exactly.
+ */
+function packUniform(words: Array<number | { f32: number }>): ArrayBuffer {
+  const size = Math.max(16, Math.ceil((words.length * 4) / 16) * 16);
+  const buffer = new ArrayBuffer(size);
+  const view = new DataView(buffer);
+  words.forEach((word, index) => {
+    if (typeof word === 'number') view.setUint32(index * 4, word, true);
+    else view.setFloat32(index * 4, word.f32, true);
+  });
+  return buffer;
+}
+
+export const uniforms = {
+  embedGather: (nTokens: number, hidden: number, rowStart: number, rowCount: number) =>
+    packUniform([nTokens, hidden, rowStart, rowCount]),
+  rmsNorm: (nTokens: number, hidden: number, eps: number) =>
+    packUniform([nTokens, hidden, { f32: eps }]),
+  matmul: (
+    nTokens: number,
+    outDim: number,
+    inDim: number,
+    hasBias: boolean,
+    rowStart = 0,
+    outStride = outDim,
+  ) => packUniform([nTokens, outDim, inDim, hasBias ? 1 : 0, rowStart, outStride]),
+  rope: (nTokens: number, nHeads: number, headDim: number, posStart: number, theta: number) =>
+    packUniform([nTokens, nHeads, headDim, posStart, { f32: theta }]),
+  attnScores: (
+    nTokens: number,
+    nHeads: number,
+    nKvHeads: number,
+    headDim: number,
+    scale: number,
+  ) => packUniform([nTokens, nHeads, nKvHeads, headDim, { f32: scale }]),
+  softmaxRows: (nRows: number, rowLen: number, causalPeriod: number) =>
+    packUniform([nRows, rowLen, causalPeriod]),
+  attnOutput: (nTokens: number, nHeads: number, nKvHeads: number, headDim: number) =>
+    packUniform([nTokens, nHeads, nKvHeads, headDim]),
+  elementwise: (n: number) => packUniform([n]),
+};
+
+export interface KernelSet {
+  embedGather: GPUComputePipeline;
+  rmsNorm: GPUComputePipeline;
+  matmul: GPUComputePipeline;
+  rope: GPUComputePipeline;
+  attnScores: GPUComputePipeline;
+  softmaxRows: GPUComputePipeline;
+  attnOutput: GPUComputePipeline;
+  residualAdd: GPUComputePipeline;
+  siluMul: GPUComputePipeline;
+  workgroupSize: number;
+}
+
+/**
+ * Build every pipeline once. Shader compilation is far too slow to sit anywhere near
+ * the generation loop, so this runs at load and the result is held for the session.
+ */
+export async function createKernels(
+  cache: PipelineCache,
+  workgroupSize: number = DEFAULT_WORKGROUP,
+): Promise<KernelSet> {
+  const constants = { wg_size: workgroupSize };
+  const build = (code: string, label: string): Promise<GPUComputePipeline> =>
+    cache.compute({ code, label: `${label}(wg=${workgroupSize})`, constants });
+
+  const [
+    embedGather,
+    rmsNorm,
+    matmul,
+    rope,
+    attnScores,
+    softmaxRows,
+    attnOutput,
+    residualAdd,
+    siluMul,
+  ] = await Promise.all([
+    build(embedGatherSource, 'embed_gather'),
+    build(rmsNormSource, 'rmsnorm'),
+    build(matmulF16Source, 'matmul_f16'),
+    build(ropeSource, 'rope'),
+    build(attnScoresSource, 'attn_scores'),
+    build(softmaxRowsSource, 'softmax_rows'),
+    build(attnOutputSource, 'attn_output'),
+    build(residualAddSource, 'residual_add'),
+    build(siluMulSource, 'silu_mul'),
+  ]);
+
+  return {
+    embedGather,
+    rmsNorm,
+    matmul,
+    rope,
+    attnScores,
+    softmaxRows,
+    attnOutput,
+    residualAdd,
+    siluMul,
+    workgroupSize,
+  };
+}
+
+/**
+ * Dispatch, checking the per-dimension workgroup limit.
+ *
+ * This is not a theoretical guard: `maxComputeWorkgroupsPerDimension` is 65,535 on every
+ * adapter (it sits at the spec default), and the lm_head has 151,936 output rows. Only
+ * the 2D dispatch shape used by matmul_f16 keeps X under the limit -- one workgroup per
+ * output row would exceed it by 2.3x on every machine.
+ */
+export function dispatch(
+  pass: GPUComputePassEncoder,
+  pipeline: GPUComputePipeline,
+  group: GPUBindGroup,
+  limits: GPUSupportedLimits,
+  counts: [number, number?, number?],
+  label: string,
+): void {
+  const [x, y = 1, z = 1] = counts;
+  const max = limits.maxComputeWorkgroupsPerDimension;
+  if (x > max || y > max || z > max) {
+    throw new RangeError(
+      `${label}: dispatch (${x}, ${y}, ${z}) exceeds maxComputeWorkgroupsPerDimension ${max}`,
+    );
+  }
+  pass.setPipeline(pipeline);
+  pass.setBindGroup(0, group);
+  pass.dispatchWorkgroups(x, y, z);
+}
+
+export function groupsFor(total: number, workgroupSize: number): number {
+  return Math.ceil(total / workgroupSize);
 }
