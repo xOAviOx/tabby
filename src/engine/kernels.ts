@@ -21,6 +21,8 @@ import softmaxRowsSource from '../shaders/softmax_rows.wgsl?raw';
 import attnOutputSource from '../shaders/attn_output.wgsl?raw';
 import residualAddSource from '../shaders/residual_add.wgsl?raw';
 import siluMulSource from '../shaders/silu_mul.wgsl?raw';
+import kvWriteSource from '../shaders/kv_write.wgsl?raw';
+import matmulF16TiledSource from '../shaders/matmul_f16_tiled.wgsl?raw';
 
 export const DEFAULT_MATVEC_WORKGROUP = 64;
 
@@ -158,16 +160,28 @@ export const uniforms = {
   rope: (nTokens: number, nHeads: number, headDim: number, posStart: number, theta: number) =>
     packUniform([nTokens, nHeads, headDim, posStart, { f32: theta }]),
   attnScores: (
-    nTokens: number,
+    nNew: number,
+    totalLen: number,
     nHeads: number,
     nKvHeads: number,
     headDim: number,
+    posStart: number,
+    kvOffset: number,
     scale: number,
-  ) => packUniform([nTokens, nHeads, nKvHeads, headDim, { f32: scale }]),
-  softmaxRows: (nRows: number, rowLen: number, causalPeriod: number) =>
-    packUniform([nRows, rowLen, causalPeriod]),
-  attnOutput: (nTokens: number, nHeads: number, nKvHeads: number, headDim: number) =>
-    packUniform([nTokens, nHeads, nKvHeads, headDim]),
+  ) =>
+    packUniform([nNew, totalLen, nHeads, nKvHeads, headDim, posStart, kvOffset, { f32: scale }]),
+  softmaxRows: (nRows: number, rowLen: number, causalPeriod: number, causalOffset = 0) =>
+    packUniform([nRows, rowLen, causalPeriod, causalOffset]),
+  attnOutput: (
+    nNew: number,
+    totalLen: number,
+    nHeads: number,
+    nKvHeads: number,
+    headDim: number,
+    posStart: number,
+    kvOffset: number,
+  ) => packUniform([nNew, totalLen, nHeads, nKvHeads, headDim, posStart, kvOffset]),
+  kvWrite: (n: number, dstStart: number) => packUniform([n, dstStart]),
   elementwise: (n: number) => packUniform([n]),
 };
 
@@ -175,12 +189,15 @@ export interface KernelSet {
   embedGather: GPUComputePipeline;
   rmsNorm: GPUComputePipeline;
   matmul: GPUComputePipeline;
+  /** Prefill variant: covers TILE_T positions per workgroup. See the shader header. */
+  matmulTiled: GPUComputePipeline;
   rope: GPUComputePipeline;
   attnScores: GPUComputePipeline;
   softmaxRows: GPUComputePipeline;
   attnOutput: GPUComputePipeline;
   residualAdd: GPUComputePipeline;
   siluMul: GPUComputePipeline;
+  kvWrite: GPUComputePipeline;
   workgroupSize: number;
 }
 
@@ -200,34 +217,40 @@ export async function createKernels(
     embedGather,
     rmsNorm,
     matmul,
+    matmulTiled,
     rope,
     attnScores,
     softmaxRows,
     attnOutput,
     residualAdd,
     siluMul,
+    kvWrite,
   ] = await Promise.all([
     build(embedGatherSource, 'embed_gather'),
     build(rmsNormSource, 'rmsnorm'),
     build(matmulF16Source, 'matmul_f16'),
+    build(matmulF16TiledSource, 'matmul_f16_tiled'),
     build(ropeSource, 'rope'),
     build(attnScoresSource, 'attn_scores'),
     build(softmaxRowsSource, 'softmax_rows'),
     build(attnOutputSource, 'attn_output'),
     build(residualAddSource, 'residual_add'),
     build(siluMulSource, 'silu_mul'),
+    build(kvWriteSource, 'kv_write'),
   ]);
 
   return {
     embedGather,
     rmsNorm,
     matmul,
+    matmulTiled,
     rope,
     attnScores,
     softmaxRows,
     attnOutput,
     residualAdd,
     siluMul,
+    kvWrite,
     workgroupSize,
   };
 }
@@ -263,3 +286,6 @@ export function dispatch(
 export function groupsFor(total: number, workgroupSize: number): number {
   return Math.ceil(total / workgroupSize);
 }
+
+/** Token positions each tiled-matmul workgroup covers. Must match TILE_T in the shader. */
+export const MATMUL_TILE_T = 4;

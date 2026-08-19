@@ -415,7 +415,16 @@ describe('M2 kernels vs CPU reference', () => {
       buffers: [
         {
           data: new Uint8Array(
-            uniforms.attnScores(nTokens, nHeads, nKvHeads, headDim, 1 / Math.sqrt(headDim)),
+            uniforms.attnScores(
+              nTokens,
+              nTokens,
+              nHeads,
+              nKvHeads,
+              headDim,
+              0,
+              0,
+              1 / Math.sqrt(headDim),
+            ),
           ),
         },
         { data: q },
@@ -429,7 +438,8 @@ describe('M2 kernels vs CPU reference', () => {
       label: 'attn_scores',
     });
 
-    const expected = attnScores(q, k, nTokens, nHeads, nKvHeads, headDim);
+    const shape = { nNew: nTokens, totalLen: nTokens, nHeads, nKvHeads, headDim };
+    const expected = attnScores(q, k, shape);
     expectClose(gpu, expected, 'attn_scores');
 
     // The mask must actually be applied, not merely produce small numbers.
@@ -451,7 +461,7 @@ describe('M2 kernels vs CPU reference', () => {
     const [gpu] = await runKernel({
       pipeline: kernels.softmaxRows,
       buffers: [
-        { data: new Uint8Array(uniforms.softmaxRows(rows, nTokens, nTokens)) },
+        { data: new Uint8Array(uniforms.softmaxRows(rows, nTokens, nTokens, 0)) },
         { data: scores, readBack: rows * nTokens },
       ],
       dispatch: [groupsFor(rows, WG)],
@@ -484,7 +494,11 @@ describe('M2 kernels vs CPU reference', () => {
     const [gpu] = await runKernel({
       pipeline: kernels.attnOutput,
       buffers: [
-        { data: new Uint8Array(uniforms.attnOutput(nTokens, nHeads, nKvHeads, headDim)) },
+        {
+          data: new Uint8Array(
+            uniforms.attnOutput(nTokens, nTokens, nHeads, nKvHeads, headDim, 0, 0),
+          ),
+        },
         { data: probs },
         { data: v },
         {
@@ -496,7 +510,8 @@ describe('M2 kernels vs CPU reference', () => {
       label: 'attn_output',
     });
 
-    expectClose(gpu, attnOutput(probs, v, nTokens, nHeads, nKvHeads, headDim), 'attn_output');
+    const shape = { nNew: nTokens, totalLen: nTokens, nHeads, nKvHeads, headDim };
+    expectClose(gpu, attnOutput(probs, v, shape), 'attn_output');
   });
 
   it('residual_add accumulates in place', async () => {

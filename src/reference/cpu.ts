@@ -179,33 +179,47 @@ export function rope(
 
 export const ATTN_NEG_INF = -3.0e38;
 
+export interface AttnShape {
+  /** Query positions being computed now. */
+  nNew: number;
+  /** Key positions available, i.e. posStart + nNew. */
+  totalLen: number;
+  nHeads: number;
+  nKvHeads: number;
+  headDim: number;
+  /** Absolute position of query 0. Non-zero only when decoding against a cache. */
+  posStart?: number;
+  /** Element offset of the layer slice within the K/V buffer. */
+  kvOffset?: number;
+}
+
 /** scores[h, i, j] = dot(q[i,h], k[j, kvHead(h)]) * scale, causally masked. */
 export function attnScores(
   q: Float32Array,
   k: Float32Array,
-  nTokens: number,
-  nHeads: number,
-  nKvHeads: number,
-  headDim: number,
+  shape: AttnShape,
 ): Float32Array {
+  const { nNew, totalLen, nHeads, nKvHeads, headDim } = shape;
+  const posStart = shape.posStart ?? 0;
+  const kvOffset = shape.kvOffset ?? 0;
   const scale = f32(1 / Math.sqrt(headDim));
   const group = nHeads / nKvHeads;
   if (!Number.isInteger(group)) {
     throw new Error(`attnScores: ${nHeads} query heads is not a multiple of ${nKvHeads} KV heads`);
   }
 
-  const out = new Float32Array(nHeads * nTokens * nTokens);
+  const out = new Float32Array(nHeads * nNew * totalLen);
   for (let h = 0; h < nHeads; h++) {
     const kvHead = Math.floor(h / group);
-    for (let i = 0; i < nTokens; i++) {
-      for (let j = 0; j < nTokens; j++) {
-        const index = (h * nTokens + i) * nTokens + j;
-        if (j > i) {
+    for (let i = 0; i < nNew; i++) {
+      for (let j = 0; j < totalLen; j++) {
+        const index = (h * nNew + i) * totalLen + j;
+        if (j > posStart + i) {
           out[index] = ATTN_NEG_INF;
           continue;
         }
         const qBase = (i * nHeads + h) * headDim;
-        const kBase = (j * nKvHeads + kvHead) * headDim;
+        const kBase = kvOffset + (j * nKvHeads + kvHead) * headDim;
         let acc = 0;
         for (let d = 0; d < headDim; d++) {
           acc = f32(acc + f32(q[qBase + d] * k[kBase + d]));
@@ -217,16 +231,20 @@ export function attnScores(
   return out;
 }
 
-/** Row-wise softmax. `causalPeriod` limits row r to its first (r % period) + 1 entries. */
+/**
+ * Row-wise softmax. `causalPeriod` limits row r to its first
+ * `causalOffset + (r % period) + 1` entries; 0 softmaxes the whole row.
+ */
 export function softmaxRows(
   x: Float32Array,
   nRows: number,
   rowLen: number,
   causalPeriod = 0,
+  causalOffset = 0,
 ): Float32Array {
   const out = Float32Array.from(x);
   for (let row = 0; row < nRows; row++) {
-    const valid = causalPeriod !== 0 ? (row % causalPeriod) + 1 : rowLen;
+    const valid = causalPeriod !== 0 ? causalOffset + (row % causalPeriod) + 1 : rowLen;
     const base = row * rowLen;
 
     let maxV = out[base];
@@ -249,21 +267,22 @@ export function softmaxRows(
 export function attnOutput(
   scores: Float32Array,
   v: Float32Array,
-  nTokens: number,
-  nHeads: number,
-  nKvHeads: number,
-  headDim: number,
+  shape: AttnShape,
 ): Float32Array {
+  const { nNew, totalLen, nHeads, nKvHeads, headDim } = shape;
+  const posStart = shape.posStart ?? 0;
+  const kvOffset = shape.kvOffset ?? 0;
   const group = nHeads / nKvHeads;
-  const out = new Float32Array(nTokens * nHeads * headDim);
-  for (let i = 0; i < nTokens; i++) {
+  const out = new Float32Array(nNew * nHeads * headDim);
+  for (let i = 0; i < nNew; i++) {
     for (let h = 0; h < nHeads; h++) {
       const kvHead = Math.floor(h / group);
-      const scoreBase = (h * nTokens + i) * nTokens;
+      const scoreBase = (h * nNew + i) * totalLen;
       for (let d = 0; d < headDim; d++) {
         let acc = 0;
-        for (let j = 0; j <= i; j++) {
-          acc = f32(acc + f32(scores[scoreBase + j] * v[(j * nKvHeads + kvHead) * headDim + d]));
+        for (let j = 0; j <= posStart + i; j++) {
+          const vBase = kvOffset + (j * nKvHeads + kvHead) * headDim;
+          acc = f32(acc + f32(scores[scoreBase + j] * v[vBase + d]));
         }
         out[(i * nHeads + h) * headDim + d] = acc;
       }

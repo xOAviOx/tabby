@@ -7,9 +7,11 @@
 struct Dims {
   n_rows  : u32,
   row_len : u32,
-  // Row r covers query position r % causal_period; entries beyond it are masked. Set to
-  // 0 to softmax the whole row.
+  // Rows are laid out as (head, query). Row r covers query index r % causal_period, whose
+  // absolute position is causal_offset + that index, so entries beyond it are masked.
+  // Set causal_period to 0 to softmax the whole row.
   causal_period : u32,
+  causal_offset : u32,
 };
 
 override wg_size : u32 = 64u;
@@ -26,7 +28,7 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
 
   var valid = dims.row_len;
   if (dims.causal_period != 0u) {
-    valid = (row % dims.causal_period) + 1u;
+    valid = dims.causal_offset + (row % dims.causal_period) + 1u;
   }
 
   let base = row * dims.row_len;
@@ -46,7 +48,7 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
   for (var i : u32 = 0u; i < valid; i = i + 1u) {
     x[base + i] = x[base + i] * inv;
   }
-  // Masked tail is zeroed so the weighted sum can read the full row unconditionally.
+  // Masked tail is zeroed so nothing downstream reads stale scores.
   for (var i : u32 = valid; i < dims.row_len; i = i + 1u) {
     x[base + i] = 0.0;
   }
