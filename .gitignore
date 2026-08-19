@@ -13,3 +13,7 @@ dist/
 
 # Golden dumps (M2) -- regenerate with tools/golden.py
 /tests/golden/
+
+# Python bytecode from tools/
+__pycache__/
+*.pyc
