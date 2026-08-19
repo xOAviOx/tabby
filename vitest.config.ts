@@ -1,8 +1,13 @@
 import { defineConfig } from 'vitest/config';
+import { playwright } from '@vitest/browser-playwright';
 
-// GPU kernels can only be validated on a real WebGPU implementation, so the whole
-// suite runs inside headless Chromium (full build, not headless-shell -- the shell
-// has no GPU stack and therefore no navigator.gpu).
+// GPU kernels can only be validated against a real WebGPU implementation, so the whole
+// suite runs inside headless Chromium.
+//
+// `channel: 'chromium'` matters: Playwright's default headless build is
+// chromium-headless-shell, which ships no GPU stack -- it exposes `navigator.gpu` but
+// `requestAdapter()` always resolves to null. The full Chromium build in new-headless
+// mode reaches the real Metal adapter.
 export default defineConfig({
   test: {
     include: ['tests/**/*.test.ts'],
@@ -10,22 +15,15 @@ export default defineConfig({
     hookTimeout: 120_000,
     browser: {
       enabled: true,
-      provider: 'playwright',
       headless: true,
       screenshotFailures: false,
-      instances: [
-        {
-          browser: 'chromium',
-          launch: {
-            channel: 'chromium',
-            args: [
-              '--enable-unsafe-webgpu',
-              '--enable-features=WebGPU',
-              '--use-angle=metal',
-            ],
-          },
+      provider: playwright({
+        launchOptions: {
+          channel: 'chromium',
+          args: ['--enable-unsafe-webgpu'],
         },
-      ],
+      }),
+      instances: [{ browser: 'chromium' }],
     },
   },
 });
