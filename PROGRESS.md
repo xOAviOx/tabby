@@ -1,6 +1,6 @@
 # PROGRESS
 
-## Current milestone: M2 — complete. M3 not started.
+## Current milestone: M3 — complete. M4 not started.
 
 ## Device limits negotiated on Apple M-series (`apple` / `metal-3`), Chromium 151 headless
 
@@ -217,6 +217,92 @@ Measured in the browser UI at 7.14 tok/s on the same prompt. Throughput falls wi
 length because there is no KV cache: every token re-runs the entire sequence, so this is
 O(n^2) by construction. That is M3's job, and this is the number it has to beat.
 
+### M3 — passed 2026-08-20
+
+`npm test` -> 79 passed across 7 files.
+
+**Gate: cached decode reproduces full recomputation.** The same prompt is generated two
+ways — recomputing the whole sequence every step, and prefilling once then decoding one
+token at a time — and compared:
+
+```
+  tokens match  : 24/24 identical
+  logits        : 24/24 steps bit-identical, worst abs diff 0.00e+0
+```
+
+Not merely "the tokens agreed": every logit of every step is **bit-identical**. That is
+the strongest available evidence that the cache feeds attention exactly the K/V a fresh
+pass computes, and it is the claim that survives a longer generation — matching tokens
+alone could be luck at any near-tie.
+
+It holds because prefill and decode are *the same code path*. `runSegment` takes
+`(nNew, posStart)` and everything else follows: RoPE rotates by the absolute position,
+the causal bound is `posStart + i`, and the cache append writes at `posStart`. Prefill is
+`nNew = prompt length`, decode is `nNew = 1`. Two separate implementations agreeing would
+have been much weaker evidence than one implementation used two ways.
+
+**Speed.**
+
+| | before | after |
+|---|---|---|
+| decode | 7.46 tok/s (M2, no cache) | **~24-26 tok/s** |
+| prefill (96 tokens) | 121 tok/s (naive matmul) | **344 tok/s** (tiled) |
+| TTFT (5-token prompt) | — | **52-62 ms** |
+
+The head-to-head "no cache vs cached" figure in the test reads 1.46x rather than the ~3.3x
+implied above, because the no-cache path now also benefits from the tiled matmul — the
+baseline improved along with the thing being measured. Against the M2 number as shipped
+last session, decode is ~3.3x.
+
+**Tiled prefill matmul — measured, not assumed.** M3 asks for "tiled matmul, shared-memory
+staging" in prefill. Each workgroup now covers `TILE_T = 4` token positions, staging the
+activation tile in workgroup memory so a weight row is fetched once and used four times.
+Weights are the dominant traffic (942 MiB against a few hundred KB of activations), so
+that is where the win is:
+
+```
+  naive : 404 ms (121 tok/s)
+  tiled : 142 ms (344 tok/s)
+  speedup: 2.84x
+  logit agreement: max abs diff 0.00e+0
+```
+
+Bit-identical, because tiling changes the order weights are *fetched* but not the order
+they are *summed*. The kernel is behind a `tiledPrefill` option, default on, kept
+switchable precisely so this table could be produced rather than asserted — and so M5 can
+sweep it. Shared memory is 4 KiB, sized against the 16 KiB floor every adapter guarantees
+rather than the 32 KiB this machine happens to grant.
+
+**Worker.** All GPU work is in `src/worker/inference.worker.ts`, which owns the device.
+`src/worker/client.ts` turns the protocol into promises and callbacks.
+
+```
+  worker load: 942 MiB weights + 3.0 MiB KV cache, pipelines compiled in 6 ms
+  streamed 12 tokens: " Paris. It is the largest city in Europe and the third"
+  TTFT 62 ms, decode 24.67 tok/s, prefill 81.0 tok/s
+```
+
+**UI stays responsive — measured on the main thread.** A `setInterval` tick runs on the
+main thread during generation; if inference were happening there, it would stall:
+
+```
+  during 16 tokens (0.58 s): 63 main-thread ticks, worst gap 12.8 ms
+```
+
+12.8 ms against a 250 ms failure threshold. The dev page shows the same thing visibly: a
+spinner driven by `requestAnimationFrame` on the main thread, sampled at 16 distinct
+angles during a run.
+
+**Cancel actually stops generation.** Cancelling after 4 tokens of a 60-token request
+produced exactly 4 and stopped. The flag is checked before each decode step *and again
+after the GPU readback resolves*, so a cancel landing mid-step cannot leak a token into a
+run the caller has abandoned.
+
+**Context overflow refuses cleanly.** `KvCache.reserve` throws `ContextOverflowError`
+before consuming anything, and the failed reservation leaves the cache length untouched.
+Silently dropping the oldest tokens would change the model's output with no indication
+anything happened.
+
 ## The M2 bug that mattered: the reference was wrong, not the engine
 
 Gate (d) failed on the first run. Our greedy output forked from PyTorch at token 4 — ours
@@ -267,9 +353,12 @@ re-hash a gigabyte) and it stays, but the actual fix was the browser context.
 Empty by design — no kernel may be optimised before it has passed a numerical gate, and
 M0's matvec is the naive reference shape that M5's optimised kernel must reproduce.
 
-| change | kernel | tok/s before | tok/s after | notes |
+The table proper begins at M5. Two M3 changes belong in it, since both were measured:
+
+| change | kernel | before | after | notes |
 |---|---|---|---|---|
-| — | — | — | — | first entries land at M5 |
+| KV cache + prefill/decode split | whole pass | 7.46 tok/s decode | ~24-26 tok/s | vs the M2 no-cache path; output bit-identical |
+| tiled prefill, 4 positions/workgroup, shared-memory activation tile | `matmul_f16_tiled` | 121 tok/s prefill | 344 tok/s | 96-token prompt, best of 3; logits bit-identical |
 
 ## Blockers
 
@@ -363,6 +452,11 @@ download. That is the M5 quantization case making itself, not a problem with M1.
 - **f16 weights are read via `unpack2x16float`, not native `f16`.** That keeps one code
   path on every adapter; `shader-f16` is optional and would need a second. M5 can add an
   f16-native variant once it is measuring. Element `i` lives in word `i >> 1`.
+- **Prefill and decode are one code path**, `runSegment(nNew, posStart)`. Resist the urge
+  to split them into separate implementations: the M3 gate's strength comes from them
+  being the same code used two ways.
+- **`active` is a reserved word in WGSL.** Cost one compile cycle; the compilation-info
+  check added at M0 pointed straight at the line.
 - `vite build` sets `copyPublicDir: false`. The weights live in `public/` so the dev
   server and test runner can serve them over HTTP, but copying a gigabyte into `dist/` on
   every build would be pointless. How weights reach the CDN is an M6 decision.
