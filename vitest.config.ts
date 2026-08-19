@@ -11,6 +11,9 @@ import { playwright } from '@vitest/browser-playwright';
 export default defineConfig({
   test: {
     include: ['tests/**/*.test.ts'],
+    // The M0 gate requires the negotiated limits and per-shape errors to be visible,
+    // and the default reporter swallows passing tests' stdout.
+    reporters: ['verbose'],
     testTimeout: 120_000,
     hookTimeout: 120_000,
     browser: {
