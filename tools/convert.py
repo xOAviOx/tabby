@@ -31,6 +31,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import shutil
 import struct
 import sys
 import time
@@ -433,6 +434,11 @@ def convert(
 
     (out_dir / "model.json").write_text(json.dumps(header, indent=2) + "\n")
 
+    # The tokenizer travels with the weights so the browser fetches one directory.
+    copied = copy_tokenizer_files(model_dir, out_dir)
+    if copied:
+        print(f"  copied {', '.join(copied)}")
+
     elapsed = time.time() - started
     print(
         f"wrote {len(chunks)} chunk(s), {total_bytes / 1e6:.1f} MB total, "
@@ -443,6 +449,22 @@ def convert(
     if total_overflow:
         print(f"  WARNING: {total_overflow} value(s) overflowed f16 range", file=sys.stderr)
     return header
+
+
+# Files the browser needs alongside the weights. Absent files are skipped: the tiny
+# synthetic test model has no tokenizer, and that is not an error.
+TOKENIZER_FILES = ("tokenizer.json", "tokenizer_config.json", "generation_config.json")
+
+
+def copy_tokenizer_files(model_dir: Path, out_dir: Path) -> list[str]:
+    copied: list[str] = []
+    for name in TOKENIZER_FILES:
+        source = model_dir / name
+        if not source.exists():
+            continue
+        shutil.copyfile(source, out_dir / name)
+        copied.append(name)
+    return copied
 
 
 def main(argv: list[str] | None = None) -> int:
