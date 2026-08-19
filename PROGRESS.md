@@ -1,6 +1,6 @@
 # PROGRESS
 
-## Current milestone: M3 — complete. M4 not started.
+## Current milestone: M4 — complete. M5 not started.
 
 ## Device limits negotiated on Apple M-series (`apple` / `metal-3`), Chromium 151 headless
 
@@ -303,6 +303,100 @@ before consuming anything, and the failed reservation leaves the cache length un
 Silently dropping the oldest tokens would change the model's output with no indication
 anything happened.
 
+### M4 — passed 2026-08-20
+
+`npm test` -> 98 passed across 8 files.
+
+**Gate: no per-token full-logit readback.** Measured, not asserted in the abstract:
+
+```
+  per token      : 328, 328, 328, 328, 328, 328, 328, 328, 328 bytes
+  full-vector    : 607744 B/token would be 1853x more
+```
+
+At temperature 0 the pool collapses to k=1 and the readback is **16 bytes a token**. The
+number reported in the chat UI's stats line is the real one, straight from the engine.
+
+**How.** Sampling is a chain of GPU passes appended to the same command buffer as the
+forward pass, so a token costs one submit and one small readback:
+
+1. two-stage reduction for `max(logits)`;
+2. two-stage reduction for `sum(exp(x - max))`, the softmax denominator;
+3. k rounds of (per-workgroup max -> reduce, record, mask), against a *copy* of the
+   logits so the originals stay intact for step 2.
+
+The output block is `[max, sumExp, (value, index) * k]`, which is the entire readback.
+k rounds is more dispatches than a histogram or a partial sort, but every round is a
+plain memory-bound pass over 608 KB that never leaves the device, and the result is
+**exact** — verified against a full CPU top-k, ids and logit values, for k in
+{1, 2, 8, 40, 64}.
+
+Returning the softmax denominator matters more than it looks: it means the k candidates
+can be converted to *exact full-vocabulary probabilities* rather than probabilities
+renormalised over a truncated set. So top-p knows its real coverage and reports
+`poolExhausted` when the nucleus was clipped by k rather than by p, instead of quietly
+renormalising a truncated tail and calling it top-p.
+
+**Gate: seeded determinism.**
+
+```
+  seed 42 : ", a very talented and very smart boy named Jack was determined to become a scientist..."
+  seed 42 : ", a very talented and very smart boy named Jack was determined to become a scientist..."
+  seed 43 : " there was a man who loved to play on the beach and ride his surfboard..."
+```
+
+Same seed replays exactly; a different seed diverges, which is what shows the sampler is
+actually sampling rather than quietly running greedy. Temperature 0 is deterministic
+regardless of seed.
+
+**Gate: multi-turn chat with correct template formatting.**
+
+```
+  user      : What is the capital of France?
+  assistant : "Paris is the capital of France."
+  user      : And of Japan?
+  assistant : "Tokyo is the capital of Japan."
+```
+
+Answering "Tokyo" to a bare "And of Japan?" is only possible if the earlier turns were
+formatted into the prompt correctly. Turns end on the template's stop token, and no
+special tokens leak into user-visible text.
+
+**Chat template: a Jinja subset, not a hardcoded format.** `tokenizer_config.json` ships
+a real Jinja2 template, so `src/tokenizer/chat_template.ts` interprets one: `if/elif/else`,
+`for` with `loop.first/last/index/index0/length`, `set`, comments, whitespace control, and
+Jinja's `trim_blocks`/`lstrip_blocks` (which is what `transformers` enables). Expressions
+cover literals, arithmetic, comparisons, `and/or/not`, `in`, `is defined/none/string`,
+attribute and index access, and the `tojson/trim/lower/upper/length/list/string/first/last`
+filters. **7/7 golden renderings exact on the first run**, checked against HF's own
+`apply_chat_template` output across single-turn, multi-turn, with and without a system
+message, with and without a generation prompt, and with unicode and multiline content.
+
+Hardcoding ChatML would have been a tenth of the work and would break on the next model,
+which is exactly what M6 tests. Anything the interpreter does not implement **throws**
+rather than rendering approximately: a chat template that renders almost-right produces a
+prompt the model was never trained on and is very hard to notice downstream.
+
+The no-system case is the one worth naming: this template injects Qwen's own default
+system prompt when the caller supplies none, which changes every token that follows.
+
+**Chat UI.** Message list with streaming, stop, new-chat, a settings panel
+(temperature / top-k / top-p / max tokens / seed / system prompt), and a per-turn stats
+line showing TTFT, prefill and decode tok/s, and the readback bytes per token. The
+spinner is still `requestAnimationFrame` on the main thread, so responsiveness stays
+visible rather than merely claimed.
+
+**Measured in the UI:** TTFT 135-195 ms, prefill 193-365 tok/s, decode ~23-25 tok/s.
+
+#### A test I had to throw away
+
+The first version of the system-prompt test asserted that "Always reply with exactly the
+word BANANA" produced BANANA. It did not — the 0.5B model answered the user instead. That
+is a fact about a 0.5B instruct model's instruction-following, not a defect in this code,
+and asserting on it would have been testing the model rather than the engine. The test now
+checks what is actually ours to guarantee: that changing the system message changes the
+output under greedy decoding. Exact template rendering is gated separately, against HF.
+
 ## The M2 bug that mattered: the reference was wrong, not the engine
 
 Gate (d) failed on the first run. Our greedy output forked from PyTorch at token 4 — ours
@@ -359,6 +453,7 @@ The table proper begins at M5. Two M3 changes belong in it, since both were meas
 |---|---|---|---|---|
 | KV cache + prefill/decode split | whole pass | 7.46 tok/s decode | ~24-26 tok/s | vs the M2 no-cache path; output bit-identical |
 | tiled prefill, 4 positions/workgroup, shared-memory activation tile | `matmul_f16_tiled` | 121 tok/s prefill | 344 tok/s | 96-token prompt, best of 3; logits bit-identical |
+| GPU top-k instead of full-logit readback | `topk_partial` + `topk_select` | 607,744 B/token | 328 B/token (16 B greedy) | 1853x less GPU->CPU traffic; top-k exact |
 
 ## Blockers
 
@@ -457,18 +552,25 @@ download. That is the M5 quantization case making itself, not a problem with M1.
   being the same code used two ways.
 - **`active` is a reserved word in WGSL.** Cost one compile cycle; the compilation-info
   check added at M0 pointed straight at the line.
+- **The chat template interpreter throws on anything it does not implement.** Keep it that
+  way. Silent approximation there produces prompts the model never saw in training.
+- **`MAX_TOP_K` (64) sizes the sample-output block**, and `topK` above it is rejected. If
+  M5 wants a bigger pool, grow the buffer with it.
 - `vite build` sets `copyPublicDir: false`. The weights live in `public/` so the dev
   server and test runner can serve them over HTTP, but copying a gigabyte into `dist/` on
   every build would be pointless. How weights reach the CDN is an M6 decision.
 
 ## Open questions for Avi
 
-1. **`transformers` in `.venv`** — see the deviations section. Added without asking because
-   M2's gate is not achievable without a reference oracle. Tools-only, never shipped. This
-   is the one thing in M2 I would most like you to either bless or veto.
-2. **Confirm the f32/f64 reference split** described under M0. Unchanged; still the pattern
-   every kernel gate follows.
-3. **Benchmark machines.** M6 needs the table measured on at least three. This Mac is one.
-   What are the other two, and will I have access to run on them?
-4. Answered and closed since last session: torch installs cleanly on Python 3.14.4 in a
-   venv (2.13.0), and B2 was designed into M2 as recommended.
+1. **`transformers` in `.venv`** — still the one thing I would most like blessed or vetoed.
+   Added at M2 without asking because the golden gates need a reference oracle. Tools-only,
+   never imported by `src/`, nothing ships. M4 leaned on it again for the chat-template
+   goldens.
+2. **Benchmark machines.** M6 needs the table on at least three. This Mac is one. What are
+   the other two, and will I have access?
+3. **Second model for M6.** `Llama-3.2-1B-Instruct` is gated on HF and needs an accepted
+   licence; `SmolLM2-360M-Instruct` is not. Unless you have a token handy I will use
+   SmolLM2, which is also a better genericity test — different vocab size, different
+   tokenizer, no tied embeddings.
+4. Closed since last session: the M3 "byte-identical" reading (it turned out to be both
+   tokens and bits, so there was no tension), torch on Python 3.14, and blockers B1/B2.
