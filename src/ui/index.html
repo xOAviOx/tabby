@@ -7,39 +7,28 @@
       rel="icon"
       href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' rx='3' fill='%232b6cb0'/%3E%3Cpath d='M4 11V5h1.6l1.4 3 1.4-3H10v6H8.7V7.2L7.4 10H6.6L5.3 7.2V11z' fill='white'/%3E%3C/svg%3E"
     />
-    <title>Browser LLM — WebGPU device</title>
+    <title>Browser LLM</title>
     <link rel="stylesheet" href="./style.css" />
   </head>
   <body>
     <main class="shell">
       <header>
         <h1>Browser LLM</h1>
-        <p class="sub">Transformer inference on WebGPU, hand-written WGSL. Milestone M1.</p>
+        <p class="sub">
+          Qwen2.5-0.5B-Instruct running entirely on your GPU via WebGPU, with hand-written
+          WGSL kernels. No server, no inference API.
+        </p>
       </header>
 
       <section id="status" class="card" aria-live="polite">
         <p class="muted">Requesting adapter…</p>
       </section>
 
-      <section id="adapter" class="card" hidden>
-        <h2>Adapter</h2>
-        <dl id="adapter-body" class="kv"></dl>
-      </section>
-
-      <section id="limits" class="card" hidden>
-        <h2>Negotiated limits</h2>
-        <p class="muted">
-          These are the granted values, not the defaults we asked to exceed. Tensor
-          sharding in M1 is sized against <code>maxStorageBufferBindingSize</code>.
-        </p>
-        <dl id="limits-body" class="kv"></dl>
-      </section>
-
       <section id="model" class="card" hidden>
         <h2>Model</h2>
         <p class="muted">
           Weights are fetched once, verified by sha256, and kept in OPFS. A second load
-          reads from OPFS and works with the network offline.
+          reads from OPFS and works offline.
         </p>
         <div class="row">
           <button id="load-model" type="button">Load model</button>
@@ -50,35 +39,76 @@
           <div class="bar"><div id="progress-fill"></div></div>
           <p id="progress-label" class="muted mono"></p>
         </div>
-        <dl id="model-body" class="kv" hidden></dl>
+        <details id="model-details" hidden>
+          <summary class="muted">Load details</summary>
+          <dl id="model-body" class="kv"></dl>
+        </details>
       </section>
 
-      <section id="generate" class="card" hidden>
-        <h2>Generation</h2>
-        <p class="muted">
-          Prefill then cached decode, running in a Web Worker. The spinner is driven by
-          the main thread — if it keeps moving, the GPU work is genuinely off-thread.
-        </p>
-        <div class="row">
-          <input id="prompt" type="text" value="The capital of France is" />
-          <label class="muted" for="max-tokens">tokens</label>
-          <input id="max-tokens" type="number" value="40" min="1" max="256" />
-          <button id="run-generate" type="button">Generate</button>
-          <button id="cancel-generate" type="button" class="secondary" disabled>Stop</button>
-          <span id="spinner" aria-hidden="true"></span>
+      <section id="chat" class="card" hidden>
+        <div class="chat-head">
+          <h2>Chat</h2>
+          <span id="chat-stats" class="muted mono"></span>
         </div>
-        <p id="generate-out" class="mono"></p>
-        <p id="generate-stats" class="muted mono"></p>
+
+        <div id="messages" class="messages" aria-live="polite"></div>
+
+        <form id="composer" class="row" autocomplete="off">
+          <input id="chat-input" type="text" placeholder="Ask something…" aria-label="Message" />
+          <button id="send" type="submit">Send</button>
+          <button id="stop" type="button" class="secondary" disabled>Stop</button>
+          <button id="reset-chat" type="button" class="secondary">New chat</button>
+          <span id="spinner" aria-hidden="true"></span>
+        </form>
+
+        <details class="settings">
+          <summary class="muted">Sampling settings</summary>
+          <div class="grid">
+            <label for="temperature">temperature <output id="temperature-out"></output></label>
+            <input id="temperature" type="range" min="0" max="2" step="0.05" value="0.7" />
+
+            <label for="top-k">top-k <output id="top-k-out"></output></label>
+            <input id="top-k" type="range" min="1" max="64" step="1" value="40" />
+
+            <label for="top-p">top-p <output id="top-p-out"></output></label>
+            <input id="top-p" type="range" min="0.05" max="1" step="0.05" value="0.9" />
+
+            <label for="max-tokens">max tokens</label>
+            <input id="max-tokens" type="number" min="1" max="512" value="256" />
+
+            <label for="seed">seed</label>
+            <input id="seed" type="number" min="0" step="1" value="0" />
+
+            <label for="system-prompt">system</label>
+            <input id="system-prompt" type="text" value="You are a helpful assistant." />
+          </div>
+          <p class="muted small">
+            Temperature 0 is greedy and ignores the seed. The same seed, prompt and
+            settings always replay the same answer.
+          </p>
+        </details>
       </section>
 
-      <section id="selfcheck" class="card" hidden>
-        <h2>Kernel self-check</h2>
+      <details id="diagnostics" class="card" hidden>
+        <summary>Diagnostics</summary>
+
+        <h3>Adapter</h3>
+        <dl id="adapter-body" class="kv"></dl>
+
+        <h3>Negotiated limits</h3>
         <p class="muted">
-          <code>matvec_f32</code> run on this GPU and compared against the scalar CPU
-          reference, same as <code>npm test</code>.
+          Granted values, not the defaults we asked to exceed. Tensor sharding is sized
+          against <code>maxStorageBufferBindingSize</code>.
+        </p>
+        <dl id="limits-body" class="kv"></dl>
+
+        <h3>Kernel self-check</h3>
+        <p class="muted">
+          <code>matvec_f32</code> on this GPU against the scalar CPU reference, the same
+          comparison <code>npm test</code> runs.
         </p>
         <table id="selfcheck-body"></table>
-      </section>
+      </details>
     </main>
     <script type="module" src="./main.ts"></script>
   </body>

@@ -1,28 +1,34 @@
 /**
- * Dev surface: negotiate a device, show what we were granted, load the converted model
- * with a real progress bar, and run the kernels that exist against their CPU references
- * so a machine can be characterised without running the test suite.
+ * Chat UI.
  *
- * This page is replaced by the chat UI at M4; the limits panel folds into the perf
- * panel at M5.
+ * All GPU work lives in the inference worker; this file only renders. The spinner is
+ * driven by requestAnimationFrame on the main thread, so it is the visible form of the
+ * "UI stays responsive" property rather than decoration -- if inference were running
+ * here, it would freeze.
+ *
+ * The diagnostics panel keeps the device/limits/self-check surface from M0-M1; it folds
+ * into the perf panel at M5.
  */
 
 import {
   describeContext,
   requestGpuContext,
   WebGpuUnavailableError,
+  type GpuContext,
 } from '../engine/device.js';
 import { PipelineCache } from '../engine/pipelines.js';
 import { runMatvecF32 } from '../engine/kernels.js';
 import { matvecF32, matvecF64 } from '../reference/cpu.js';
 import { ModelStore, type LoadProgress } from '../engine/store.js';
 import { InferenceClient, type LoadedInfo } from '../worker/client.js';
+import type { SamplingParams } from '../engine/sampler.js';
+import type { ChatMessage } from '../tokenizer/chat_template.js';
 
-/** Which converted model the dev page loads. Produced by tools/convert.py. */
 const MODEL_ID = 'qwen2.5-0.5b-instruct';
 const MODEL_BASE = new URL(`/models/${MODEL_ID}/`, location.href).href;
+const MAX_SEQ_LEN = 1024;
 
-const SELF_CHECK_SHAPES: Array<{ m: number; n: number }> = [
+const SELF_CHECK_SHAPES = [
   { m: 3, n: 7 },
   { m: 65, n: 129 },
   { m: 1000, n: 999 },
@@ -31,6 +37,11 @@ const SELF_CHECK_SHAPES: Array<{ m: number; n: number }> = [
 
 /** Same tolerance the test suite gates on. */
 const TOLERANCE = 1e-4;
+const MIB = 1024 * 1024;
+
+// ---------------------------------------------------------------------------------------
+// small DOM helpers
+// ---------------------------------------------------------------------------------------
 
 function el<T extends HTMLElement>(id: string): T {
   const node = document.getElementById(id);
@@ -56,6 +67,299 @@ function defineList(target: HTMLElement, rows: Array<[string, string]>): void {
   );
 }
 
+function formatBytes(bytes: number): string {
+  if (bytes >= MIB) return `${(bytes / MIB).toFixed(1)} MiB`;
+  if (bytes >= 1024) return `${(bytes / 1024).toFixed(1)} KiB`;
+  return `${bytes} B`;
+}
+
+function formatMs(ms: number): string {
+  return ms >= 1000 ? `${(ms / 1000).toFixed(2)} s` : `${ms.toFixed(0)} ms`;
+}
+
+function formatLimit(key: string, value: number): string {
+  return key.endsWith('Size') && value >= MIB
+    ? `${value.toLocaleString()}  (${(value / MIB).toFixed(0)} MiB)`
+    : value.toLocaleString();
+}
+
+function renderUnavailable(message: string, detail: string): void {
+  const status = el('status');
+  status.classList.add('fail');
+  status.replaceChildren();
+  const heading = document.createElement('h2');
+  heading.textContent = message;
+  const body = document.createElement('p');
+  body.textContent = detail;
+  const help = document.createElement('p');
+  help.className = 'muted';
+  help.textContent =
+    'WebGPU needs Chrome or Edge 113+, or Safari 18+. On Linux it may require enabling ' +
+    'the Vulkan backend. Firefox ships it in release from 141 on Windows only.';
+  status.append(heading, body, help);
+}
+
+// ---------------------------------------------------------------------------------------
+// chat
+// ---------------------------------------------------------------------------------------
+
+function readSampling(): SamplingParams {
+  return {
+    temperature: Number(el<HTMLInputElement>('temperature').value),
+    topK: Number(el<HTMLInputElement>('top-k').value),
+    topP: Number(el<HTMLInputElement>('top-p').value),
+    seed: Number(el<HTMLInputElement>('seed').value) || 0,
+  };
+}
+
+function bindSettingReadouts(): void {
+  for (const [input, output] of [
+    ['temperature', 'temperature-out'],
+    ['top-k', 'top-k-out'],
+    ['top-p', 'top-p-out'],
+  ] as Array<[string, string]>) {
+    const source = el<HTMLInputElement>(input);
+    const target = el<HTMLOutputElement>(output);
+    const sync = (): void => {
+      target.textContent = source.value;
+    };
+    source.addEventListener('input', sync);
+    sync();
+  }
+}
+
+function setUpChat(client: InferenceClient, info: LoadedInfo): void {
+  show('chat');
+  bindSettingReadouts();
+
+  const messagesEl = el('messages');
+  const input = el<HTMLInputElement>('chat-input');
+  const sendButton = el<HTMLButtonElement>('send');
+  const stopButton = el<HTMLButtonElement>('stop');
+  const resetButton = el<HTMLButtonElement>('reset-chat');
+  const spinner = el('spinner');
+  const statsEl = el('chat-stats');
+
+  /** The conversation so far. Re-rendered through the model's template every turn. */
+  const history: ChatMessage[] = [];
+  let busy = false;
+
+  const bubble = (role: string, text = ''): HTMLElement => {
+    const node = document.createElement('div');
+    node.className = `msg ${role}`;
+    node.textContent = text;
+    messagesEl.append(node);
+    messagesEl.scrollTop = messagesEl.scrollHeight;
+    return node;
+  };
+
+  let spinning = false;
+  let angle = 0;
+  const tick = (): void => {
+    if (!spinning) return;
+    angle = (angle + 6) % 360;
+    spinner.style.transform = `rotate(${angle}deg)`;
+    requestAnimationFrame(tick);
+  };
+
+  const setBusy = (value: boolean): void => {
+    busy = value;
+    sendButton.disabled = value;
+    input.disabled = value;
+    resetButton.disabled = value;
+    stopButton.disabled = !value;
+    spinning = value;
+    spinner.classList.toggle('spinning', value);
+    if (value) requestAnimationFrame(tick);
+  };
+
+  resetButton.addEventListener('click', () => {
+    history.length = 0;
+    messagesEl.replaceChildren();
+    statsEl.textContent = `context ${info.maxSeqLen} tokens`;
+  });
+
+  el<HTMLFormElement>('composer').addEventListener('submit', async (event) => {
+    event.preventDefault();
+    if (busy) return;
+    const text = input.value.trim();
+    if (!text) return;
+
+    input.value = '';
+    bubble('user', text);
+    history.push({ role: 'user', content: text });
+
+    const reply = bubble('assistant');
+    const caret = document.createElement('span');
+    caret.className = 'caret';
+    reply.append(caret);
+
+    const systemPrompt = el<HTMLInputElement>('system-prompt').value.trim();
+    const messages: ChatMessage[] = systemPrompt
+      ? [{ role: 'system', content: systemPrompt }, ...history]
+      : [...history];
+
+    setBusy(true);
+    statsEl.textContent = 'thinking…';
+
+    let answer = '';
+    const handle = client.generate({
+      messages,
+      maxNewTokens: Number(el<HTMLInputElement>('max-tokens').value) || 256,
+      sampling: readSampling(),
+      onToken: (chunk) => {
+        answer += chunk;
+        caret.remove();
+        reply.textContent = answer;
+        reply.append(caret);
+        messagesEl.scrollTop = messagesEl.scrollHeight;
+      },
+    });
+    stopButton.onclick = () => handle.cancel();
+
+    try {
+      const stats = await handle.done;
+      caret.remove();
+      reply.textContent = answer;
+      history.push({ role: 'assistant', content: answer });
+
+      statsEl.textContent =
+        `${stats.generatedTokens} tok · TTFT ${stats.ttftMs.toFixed(0)} ms · ` +
+        `prefill ${stats.prefillTokPerSec.toFixed(0)} tok/s · ` +
+        `decode ${stats.decodeTokPerSec.toFixed(1)} tok/s · ` +
+        `${stats.readbackBytesPerToken} B/token readback` +
+        (stats.cancelled ? ' · stopped' : '') +
+        (stats.poolExhausted ? ' · top-p clipped by k' : '');
+    } catch (error) {
+      caret.remove();
+      reply.remove();
+      // Drop the user turn too, so history stays a valid alternating conversation.
+      history.pop();
+      bubble('error', error instanceof Error ? error.message : String(error));
+      statsEl.textContent = '';
+    } finally {
+      setBusy(false);
+      input.focus();
+    }
+  });
+
+  statsEl.textContent = `context ${info.maxSeqLen} tokens`;
+  input.focus();
+}
+
+// ---------------------------------------------------------------------------------------
+// model panel
+// ---------------------------------------------------------------------------------------
+
+async function setUpModelPanel(): Promise<void> {
+  show('model');
+  const loadButton = el<HTMLButtonElement>('load-model');
+  const clearButton = el<HTMLButtonElement>('clear-cache');
+  const status = el('model-status');
+  const progressWrap = el('progress-wrap');
+  const fill = el('progress-fill');
+  const label = el('progress-label');
+  const details = el('model-details');
+  const body = el('model-body');
+
+  let client: InferenceClient | null = null;
+
+  const describeCache = async (): Promise<void> => {
+    const store = await ModelStore.open(MODEL_ID);
+    const bytes = await store.usageBytes();
+    status.textContent = bytes > 0 ? `${formatBytes(bytes)} cached in OPFS` : 'not cached';
+  };
+
+  const onProgress = (progress: LoadProgress): void => {
+    progressWrap.hidden = false;
+    const fraction = progress.totalBytes > 0 ? progress.loadedBytes / progress.totalBytes : 0;
+    fill.style.width = `${(fraction * 100).toFixed(2)}%`;
+    // Real byte counts, not a synthetic ramp.
+    const source =
+      progress.phase === 'download' ? (progress.fromCache ? 'cache' : 'network') : 'GPU';
+    label.textContent =
+      `${progress.phase} (${source})  ${formatBytes(progress.loadedBytes)} / ` +
+      `${formatBytes(progress.totalBytes)}  ${(fraction * 100).toFixed(1)}%  ${progress.detail}`;
+  };
+
+  loadButton.addEventListener('click', async () => {
+    loadButton.disabled = true;
+    clearButton.disabled = true;
+    details.hidden = true;
+    status.textContent = 'loading…';
+    try {
+      client?.terminate();
+      client = new InferenceClient();
+      const info = await client.load({
+        baseUrl: MODEL_BASE,
+        modelId: MODEL_ID,
+        maxSeqLen: MAX_SEQ_LEN,
+        onProgress,
+      });
+
+      const { stats, config } = info;
+      fill.style.width = '100%';
+      status.textContent = stats.servedFromCache ? 'loaded from OPFS' : 'downloaded and cached';
+
+      defineList(body, [
+        ['served from', stats.servedFromCache ? 'OPFS cache' : 'network'],
+        [
+          'fetch',
+          `${formatMs(stats.downloadMs)}  (${formatBytes(stats.networkBytes)} network, ` +
+            `${formatBytes(stats.cacheBytes)} cache)`,
+        ],
+        ['GPU upload', formatMs(stats.uploadMs)],
+        ['pipelines', formatMs(stats.pipelineMs)],
+        ['total', formatMs(stats.totalMs)],
+        ['tensors / buffers', `${stats.tensorCount} / ${stats.bufferCount}`],
+        ['weights VRAM', formatBytes(stats.vramBytes)],
+        ['KV cache', `${formatBytes(stats.kvCacheBytes)} for ${info.maxSeqLen} tokens`],
+        ['chat template', info.hasChatTemplate ? 'loaded' : 'none — completion only'],
+        ['architecture', `${config.modelType}, ${config.numHiddenLayers} layers`],
+        ['hidden / intermediate', `${config.hiddenSize} / ${config.intermediateSize}`],
+        [
+          'heads (Q / KV)',
+          `${config.numAttentionHeads} / ${config.numKeyValueHeads} ` +
+            `(${config.queryHeadsPerKvHead} per KV)`,
+        ],
+        ['head_dim', String(config.headDim)],
+        ['vocab', config.vocabSize.toLocaleString()],
+        ['rope_theta', String(config.ropeTheta)],
+        ['tied embeddings', config.tieWordEmbeddings ? 'yes' : 'no'],
+      ]);
+      details.hidden = false;
+      setUpChat(client, info);
+    } catch (error) {
+      status.textContent = '';
+      label.textContent = '';
+      const message = document.createElement('p');
+      message.className = 'bad';
+      message.textContent = `Load failed: ${String(error)}`;
+      el('model').append(message);
+    } finally {
+      loadButton.disabled = false;
+      clearButton.disabled = false;
+    }
+  });
+
+  clearButton.addEventListener('click', async () => {
+    clearButton.disabled = true;
+    details.hidden = true;
+    progressWrap.hidden = true;
+    fill.style.width = '0';
+    const store = await ModelStore.open(MODEL_ID);
+    await store.clear();
+    await describeCache();
+    clearButton.disabled = false;
+  });
+
+  await describeCache();
+}
+
+// ---------------------------------------------------------------------------------------
+// diagnostics
+// ---------------------------------------------------------------------------------------
+
 function seededRandom(count: number, seed: number): Float32Array {
   let a = seed >>> 0;
   const out = new Float32Array(count);
@@ -75,56 +379,11 @@ function maxAbsError(a: ArrayLike<number>, b: ArrayLike<number>): number {
   return worst;
 }
 
-const MIB = 1024 * 1024;
-
-function formatLimit(key: string, value: number): string {
-  return key.endsWith('Size') && value >= MIB
-    ? `${value.toLocaleString()}  (${(value / MIB).toFixed(0)} MiB)`
-    : value.toLocaleString();
-}
-
-function renderUnavailable(message: string, detail: string): void {
-  const status = el('status');
-  status.classList.add('fail');
-  status.replaceChildren();
-  const h = document.createElement('h2');
-  h.textContent = message;
-  const p = document.createElement('p');
-  p.textContent = detail;
-  const help = document.createElement('p');
-  help.className = 'muted';
-  help.textContent =
-    'WebGPU needs Chrome or Edge 113+, or Safari 18+. On Linux it may require enabling ' +
-    'the Vulkan backend. Firefox ships it in release from 141 on Windows only.';
-  status.append(h, p, help);
-}
-
-async function main(): Promise<void> {
-  let ctx;
-  try {
-    ctx = await requestGpuContext({
-      onDeviceLost: (info) => renderUnavailable('GPU device lost', `${info.reason}: ${info.message}`),
-    });
-  } catch (err) {
-    if (err instanceof WebGpuUnavailableError) {
-      renderUnavailable('WebGPU is not available in this browser', err.message);
-    } else {
-      renderUnavailable('Could not initialise WebGPU', String(err));
-    }
-    return;
-  }
-
-  console.log(`=== negotiated WebGPU context ===\n${describeContext(ctx)}`);
-
-  el('status').replaceChildren(
-    Object.assign(document.createElement('p'), {
-      className: 'ok',
-      textContent: 'WebGPU device acquired.',
-    }),
-  );
-
+async function setUpDiagnostics(ctx: GpuContext): Promise<void> {
+  show('diagnostics');
   const { info } = ctx;
-  defineList(show('adapter').querySelector('dl')!, [
+
+  defineList(el('adapter-body'), [
     ['vendor', info.vendor || '(not reported)'],
     ['architecture', info.architecture || '(not reported)'],
     ['device', info.device || '(not reported)'],
@@ -136,13 +395,13 @@ async function main(): Promise<void> {
   ]);
 
   defineList(
-    show('limits').querySelector('dl')!,
+    el('limits-body'),
     Object.entries(ctx.limits)
       .sort(([a], [b]) => a.localeCompare(b))
       .map(([key, value]) => [key, formatLimit(key, value)] as [string, string]),
   );
 
-  const table = show('selfcheck').querySelector('table')!;
+  const table = el<HTMLTableElement>('selfcheck-body');
   table.innerHTML =
     '<thead><tr><th>shape</th><th>max abs err (f32 ref)</th>' +
     '<th>max abs err (f64 ref)</th><th>ms</th><th></th></tr></thead><tbody></tbody>';
@@ -169,201 +428,43 @@ async function main(): Promise<void> {
       [elapsed.toFixed(1), ''],
       [pass ? 'pass' : 'FAIL', pass ? 'ok' : 'bad'],
     ] as Array<[string, string]>) {
-      const td = document.createElement('td');
-      td.textContent = text;
-      if (cls) td.className = cls;
-      row.append(td);
+      const cell = document.createElement('td');
+      cell.textContent = text;
+      if (cls) cell.className = cls;
+      row.append(cell);
     }
     tbody.append(row);
   }
+}
+
+// ---------------------------------------------------------------------------------------
+
+async function main(): Promise<void> {
+  let ctx: GpuContext;
+  try {
+    ctx = await requestGpuContext({
+      onDeviceLost: (info) =>
+        renderUnavailable('GPU device lost', `${info.reason}: ${info.message}`),
+    });
+  } catch (error) {
+    if (error instanceof WebGpuUnavailableError) {
+      renderUnavailable('WebGPU is not available in this browser', error.message);
+    } else {
+      renderUnavailable('Could not initialise WebGPU', String(error));
+    }
+    return;
+  }
+
+  console.log(`=== negotiated WebGPU context ===\n${describeContext(ctx)}`);
+  el('status').replaceChildren(
+    Object.assign(document.createElement('p'), {
+      className: 'ok',
+      textContent: 'WebGPU device acquired.',
+    }),
+  );
 
   await setUpModelPanel();
-}
-
-// ---------------------------------------------------------------------------------------
-// model loading panel
-// ---------------------------------------------------------------------------------------
-
-const MIB_BYTES = 1024 * 1024;
-
-function formatBytes(bytes: number): string {
-  if (bytes >= MIB_BYTES) return `${(bytes / MIB_BYTES).toFixed(1)} MiB`;
-  if (bytes >= 1024) return `${(bytes / 1024).toFixed(1)} KiB`;
-  return `${bytes} B`;
-}
-
-function formatMs(ms: number): string {
-  return ms >= 1000 ? `${(ms / 1000).toFixed(2)} s` : `${ms.toFixed(0)} ms`;
-}
-
-async function setUpModelPanel(): Promise<void> {
-  show('model');
-  const loadButton = el<HTMLButtonElement>('load-model');
-  const clearButton = el<HTMLButtonElement>('clear-cache');
-  const status = el('model-status');
-  const progressWrap = el('progress-wrap');
-  const fill = el('progress-fill');
-  const label = el('progress-label');
-  const body = el('model-body');
-
-  let client: InferenceClient | null = null;
-
-  const describeCache = async (): Promise<void> => {
-    const store = await ModelStore.open(MODEL_ID);
-    const bytes = await store.usageBytes();
-    status.textContent = bytes > 0 ? `${formatBytes(bytes)} cached in OPFS` : 'not cached';
-  };
-
-  const onProgress = (p: LoadProgress): void => {
-    progressWrap.hidden = false;
-    const fraction = p.totalBytes > 0 ? p.loadedBytes / p.totalBytes : 0;
-    fill.style.width = `${(fraction * 100).toFixed(2)}%`;
-    // Real byte counts, not a synthetic ramp -- these are the numbers the loader moved.
-    const source = p.phase === 'download' ? (p.fromCache ? 'cache' : 'network') : 'GPU';
-    label.textContent =
-      `${p.phase} (${source})  ${formatBytes(p.loadedBytes)} / ${formatBytes(p.totalBytes)}  ` +
-      `${(fraction * 100).toFixed(1)}%  ${p.detail}`;
-  };
-
-  loadButton.addEventListener('click', async () => {
-    loadButton.disabled = true;
-    clearButton.disabled = true;
-    body.hidden = true;
-    status.textContent = 'loading…';
-    try {
-      client?.terminate();
-      client = new InferenceClient();
-      const info = await client.load({
-        baseUrl: MODEL_BASE,
-        modelId: MODEL_ID,
-        maxSeqLen: 512,
-        onProgress,
-      });
-
-      const { stats, config } = info;
-      fill.style.width = '100%';
-      status.textContent = stats.servedFromCache ? 'loaded from OPFS' : 'downloaded and cached';
-
-      defineList(body, [
-        ['served from', stats.servedFromCache ? 'OPFS cache' : 'network'],
-        ['fetch', `${formatMs(stats.downloadMs)}  (${formatBytes(stats.networkBytes)} network, ${formatBytes(stats.cacheBytes)} cache)`],
-        ['GPU upload', formatMs(stats.uploadMs)],
-        ['pipelines', formatMs(stats.pipelineMs)],
-        ['total', formatMs(stats.totalMs)],
-        ['tensors / buffers', `${stats.tensorCount} / ${stats.bufferCount}`],
-        ['weights VRAM', formatBytes(stats.vramBytes)],
-        ['KV cache', `${formatBytes(stats.kvCacheBytes)} for ${info.maxSeqLen} tokens`],
-        ['architecture', `${config.modelType}, ${config.numHiddenLayers} layers`],
-        ['hidden / intermediate', `${config.hiddenSize} / ${config.intermediateSize}`],
-        ['heads (Q / KV)', `${config.numAttentionHeads} / ${config.numKeyValueHeads} (${config.queryHeadsPerKvHead} per KV)`],
-        ['head_dim', String(config.headDim)],
-        ['vocab', config.vocabSize.toLocaleString()],
-        ['rope_theta', String(config.ropeTheta)],
-        ['tied embeddings', config.tieWordEmbeddings ? 'yes' : 'no'],
-      ]);
-      body.hidden = false;
-      setUpGeneration(client, info);
-    } catch (err) {
-      status.textContent = '';
-      label.textContent = '';
-      const p = document.createElement('p');
-      p.className = 'bad';
-      p.textContent = `Load failed: ${String(err)}`;
-      el('model').append(p);
-    } finally {
-      loadButton.disabled = false;
-      clearButton.disabled = false;
-    }
-  });
-
-  clearButton.addEventListener('click', async () => {
-    clearButton.disabled = true;
-    body.hidden = true;
-    progressWrap.hidden = true;
-    fill.style.width = '0';
-    const store = await ModelStore.open(MODEL_ID);
-    await store.clear();
-    await describeCache();
-    clearButton.disabled = false;
-  });
-
-  await describeCache();
-}
-
-// ---------------------------------------------------------------------------------------
-// generation panel
-// ---------------------------------------------------------------------------------------
-
-let generationReady = false;
-
-function setUpGeneration(client: InferenceClient, info: LoadedInfo): void {
-  show('generate');
-  if (generationReady) return;
-  generationReady = true;
-
-  const promptInput = el<HTMLInputElement>('prompt');
-  const maxTokensInput = el<HTMLInputElement>('max-tokens');
-  const runButton = el<HTMLButtonElement>('run-generate');
-  const stopButton = el<HTMLButtonElement>('cancel-generate');
-  const spinner = el('spinner');
-  const out = el('generate-out');
-  const stats = el('generate-stats');
-
-  // Driven by the main thread. If inference were not in a worker this would freeze, so
-  // it is the visible form of the "UI stays responsive" gate.
-  let spinning = false;
-  let angle = 0;
-  const tick = (): void => {
-    if (!spinning) return;
-    angle = (angle + 6) % 360;
-    spinner.style.transform = `rotate(${angle}deg)`;
-    requestAnimationFrame(tick);
-  };
-
-  stats.textContent = `ready — context ${info.maxSeqLen} tokens`;
-
-  runButton.addEventListener('click', async () => {
-    runButton.disabled = true;
-    stopButton.disabled = false;
-    spinning = true;
-    spinner.classList.add('spinning');
-    requestAnimationFrame(tick);
-
-    const prompt = promptInput.value;
-    const maxNewTokens = Math.max(1, Math.min(256, Number(maxTokensInput.value) || 40));
-
-    const promptSpan = document.createElement('span');
-    promptSpan.className = 'prompt';
-    promptSpan.textContent = prompt;
-    const outputSpan = document.createElement('span');
-    out.replaceChildren(promptSpan, outputSpan);
-    stats.textContent = 'generating…';
-
-    const handle = client.generate({
-      prompt,
-      maxNewTokens,
-      onToken: (text) => {
-        outputSpan.textContent += text;
-      },
-    });
-    stopButton.onclick = () => handle.cancel();
-
-    try {
-      const result = await handle.done;
-      stats.textContent =
-        `${result.generatedTokens} tokens · TTFT ${result.ttftMs.toFixed(0)} ms · ` +
-        `prefill ${result.prefillTokPerSec.toFixed(1)} tok/s · ` +
-        `decode ${result.decodeTokPerSec.toFixed(2)} tok/s` +
-        (result.cancelled ? ' · stopped' : result.stopped ? ' · hit EOS' : '');
-    } catch (err) {
-      stats.textContent = `generation failed: ${String(err)}`;
-    } finally {
-      spinning = false;
-      spinner.classList.remove('spinning');
-      runButton.disabled = false;
-      stopButton.disabled = true;
-    }
-  });
+  await setUpDiagnostics(ctx);
 }
 
 void main();
