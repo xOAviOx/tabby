@@ -229,3 +229,22 @@ input {
 #generate-stats {
   margin: 0;
 }
+
+/*
+ * Driven by requestAnimationFrame on the main thread. It is a load-bearing part of the
+ * page, not decoration: if inference were running on the main thread this would freeze.
+ */
+#spinner {
+  display: inline-block;
+  width: 0.85rem;
+  height: 0.85rem;
+  border: 2px solid var(--line);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  opacity: 0;
+  transition: opacity 150ms;
+}
+
+#spinner.spinning {
+  opacity: 1;
+}

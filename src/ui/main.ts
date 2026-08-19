@@ -11,16 +11,12 @@ import {
   describeContext,
   requestGpuContext,
   WebGpuUnavailableError,
-  type GpuContext,
 } from '../engine/device.js';
 import { PipelineCache } from '../engine/pipelines.js';
 import { runMatvecF32 } from '../engine/kernels.js';
 import { matvecF32, matvecF64 } from '../reference/cpu.js';
 import { ModelStore, type LoadProgress } from '../engine/store.js';
-import { loadModel, type LoadedModel } from '../engine/model.js';
-import { ForwardPass } from '../engine/forward.js';
-import { generateGreedy } from '../engine/sampler.js';
-import { BpeTokenizer } from '../tokenizer/bpe.js';
+import { InferenceClient, type LoadedInfo } from '../worker/client.js';
 
 /** Which converted model the dev page loads. Produced by tools/convert.py. */
 const MODEL_ID = 'qwen2.5-0.5b-instruct';
@@ -181,7 +177,7 @@ async function main(): Promise<void> {
     tbody.append(row);
   }
 
-  await setUpModelPanel(ctx);
+  await setUpModelPanel();
 }
 
 // ---------------------------------------------------------------------------------------
@@ -200,8 +196,8 @@ function formatMs(ms: number): string {
   return ms >= 1000 ? `${(ms / 1000).toFixed(2)} s` : `${ms.toFixed(0)} ms`;
 }
 
-async function setUpModelPanel(ctx: GpuContext): Promise<void> {
-  const section = show('model');
+async function setUpModelPanel(): Promise<void> {
+  show('model');
   const loadButton = el<HTMLButtonElement>('load-model');
   const clearButton = el<HTMLButtonElement>('clear-cache');
   const status = el('model-status');
@@ -210,7 +206,7 @@ async function setUpModelPanel(ctx: GpuContext): Promise<void> {
   const label = el('progress-label');
   const body = el('model-body');
 
-  let loaded: LoadedModel | null = null;
+  let client: InferenceClient | null = null;
 
   const describeCache = async (): Promise<void> => {
     const store = await ModelStore.open(MODEL_ID);
@@ -235,13 +231,16 @@ async function setUpModelPanel(ctx: GpuContext): Promise<void> {
     body.hidden = true;
     status.textContent = 'loading…';
     try {
-      loaded?.weights.destroy();
-      loaded = await loadModel(ctx.device, {
+      client?.terminate();
+      client = new InferenceClient();
+      const info = await client.load({
         baseUrl: MODEL_BASE,
         modelId: MODEL_ID,
+        maxSeqLen: 512,
         onProgress,
       });
-      const { stats, config } = loaded;
+
+      const { stats, config } = info;
       fill.style.width = '100%';
       status.textContent = stats.servedFromCache ? 'loaded from OPFS' : 'downloaded and cached';
 
@@ -249,28 +248,28 @@ async function setUpModelPanel(ctx: GpuContext): Promise<void> {
         ['served from', stats.servedFromCache ? 'OPFS cache' : 'network'],
         ['fetch', `${formatMs(stats.downloadMs)}  (${formatBytes(stats.networkBytes)} network, ${formatBytes(stats.cacheBytes)} cache)`],
         ['GPU upload', formatMs(stats.uploadMs)],
+        ['pipelines', formatMs(stats.pipelineMs)],
         ['total', formatMs(stats.totalMs)],
         ['tensors / buffers', `${stats.tensorCount} / ${stats.bufferCount}`],
-        ['VRAM', formatBytes(stats.vramBytes)],
-        ['chunks', String(stats.chunkCount)],
+        ['weights VRAM', formatBytes(stats.vramBytes)],
+        ['KV cache', `${formatBytes(stats.kvCacheBytes)} for ${info.maxSeqLen} tokens`],
         ['architecture', `${config.modelType}, ${config.numHiddenLayers} layers`],
         ['hidden / intermediate', `${config.hiddenSize} / ${config.intermediateSize}`],
         ['heads (Q / KV)', `${config.numAttentionHeads} / ${config.numKeyValueHeads} (${config.queryHeadsPerKvHead} per KV)`],
         ['head_dim', String(config.headDim)],
         ['vocab', config.vocabSize.toLocaleString()],
         ['rope_theta', String(config.ropeTheta)],
-        ['rms_norm_eps', String(config.rmsNormEps)],
         ['tied embeddings', config.tieWordEmbeddings ? 'yes' : 'no'],
       ]);
       body.hidden = false;
-      await setUpGeneration(ctx, loaded);
+      setUpGeneration(client, info);
     } catch (err) {
       status.textContent = '';
       label.textContent = '';
       const p = document.createElement('p');
       p.className = 'bad';
       p.textContent = `Load failed: ${String(err)}`;
-      section.append(p);
+      el('model').append(p);
     } finally {
       loadButton.disabled = false;
       clearButton.disabled = false;
@@ -279,8 +278,6 @@ async function setUpModelPanel(ctx: GpuContext): Promise<void> {
 
   clearButton.addEventListener('click', async () => {
     clearButton.disabled = true;
-    loaded?.weights.destroy();
-    loaded = null;
     body.hidden = true;
     progressWrap.hidden = true;
     fill.style.width = '0';
@@ -299,32 +296,41 @@ async function setUpModelPanel(ctx: GpuContext): Promise<void> {
 
 let generationReady = false;
 
-async function setUpGeneration(ctx: GpuContext, model: LoadedModel): Promise<void> {
-  const section = show('generate');
+function setUpGeneration(client: InferenceClient, info: LoadedInfo): void {
+  show('generate');
   if (generationReady) return;
   generationReady = true;
 
   const promptInput = el<HTMLInputElement>('prompt');
   const maxTokensInput = el<HTMLInputElement>('max-tokens');
-  const button = el<HTMLButtonElement>('run-generate');
+  const runButton = el<HTMLButtonElement>('run-generate');
+  const stopButton = el<HTMLButtonElement>('cancel-generate');
+  const spinner = el('spinner');
   const out = el('generate-out');
   const stats = el('generate-stats');
 
-  stats.textContent = 'compiling kernels…';
-  const tokenizer = await BpeTokenizer.fromUrl(new URL('tokenizer.json', MODEL_BASE).href);
-  const forward = await ForwardPass.create(
-    ctx.device,
-    model,
-    new PipelineCache(ctx.device),
-    { maxTokens: 256 },
-  );
-  stats.textContent = 'ready';
-  void section;
+  // Driven by the main thread. If inference were not in a worker this would freeze, so
+  // it is the visible form of the "UI stays responsive" gate.
+  let spinning = false;
+  let angle = 0;
+  const tick = (): void => {
+    if (!spinning) return;
+    angle = (angle + 6) % 360;
+    spinner.style.transform = `rotate(${angle}deg)`;
+    requestAnimationFrame(tick);
+  };
 
-  button.addEventListener('click', async () => {
-    button.disabled = true;
+  stats.textContent = `ready — context ${info.maxSeqLen} tokens`;
+
+  runButton.addEventListener('click', async () => {
+    runButton.disabled = true;
+    stopButton.disabled = false;
+    spinning = true;
+    spinner.classList.add('spinning');
+    requestAnimationFrame(tick);
+
     const prompt = promptInput.value;
-    const maxNewTokens = Math.max(1, Math.min(128, Number(maxTokensInput.value) || 20));
+    const maxNewTokens = Math.max(1, Math.min(256, Number(maxTokensInput.value) || 40));
 
     const promptSpan = document.createElement('span');
     promptSpan.className = 'prompt';
@@ -333,32 +339,29 @@ async function setUpGeneration(ctx: GpuContext, model: LoadedModel): Promise<voi
     out.replaceChildren(promptSpan, outputSpan);
     stats.textContent = 'generating…';
 
+    const handle = client.generate({
+      prompt,
+      maxNewTokens,
+      onToken: (text) => {
+        outputSpan.textContent += text;
+      },
+    });
+    stopButton.onclick = () => handle.cancel();
+
     try {
-      const ids = tokenizer.encode(prompt);
-      const produced: number[] = [];
-      const result = await generateGreedy(
-        ids,
-        async (sequence) => (await forward.run(sequence)).logits,
-        {
-          maxNewTokens,
-          stopTokens: model.config.eosTokenIds,
-          onToken: (id) => {
-            produced.push(id);
-            // Decoded from scratch each step: a multi-byte character is often split
-            // across tokens, so decoding incrementally would emit replacement chars.
-            outputSpan.textContent = tokenizer.decode(produced, { skipSpecialTokens: true });
-          },
-        },
-      );
-      const tokPerSec = (result.tokens.length / result.ms) * 1000;
+      const result = await handle.done;
       stats.textContent =
-        `${result.tokens.length} tokens in ${(result.ms / 1000).toFixed(2)} s ` +
-        `(${tokPerSec.toFixed(2)} tok/s, greedy, no KV cache)` +
-        (result.stopped ? ' — stopped at EOS' : '');
+        `${result.generatedTokens} tokens · TTFT ${result.ttftMs.toFixed(0)} ms · ` +
+        `prefill ${result.prefillTokPerSec.toFixed(1)} tok/s · ` +
+        `decode ${result.decodeTokPerSec.toFixed(2)} tok/s` +
+        (result.cancelled ? ' · stopped' : result.stopped ? ' · hit EOS' : '');
     } catch (err) {
       stats.textContent = `generation failed: ${String(err)}`;
     } finally {
-      button.disabled = false;
+      spinning = false;
+      spinner.classList.remove('spinning');
+      runButton.disabled = false;
+      stopButton.disabled = true;
     }
   });
 }

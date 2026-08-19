@@ -56,14 +56,16 @@
       <section id="generate" class="card" hidden>
         <h2>Generation</h2>
         <p class="muted">
-          Greedy decoding, no KV cache — the M2 baseline. Every token re-runs the whole
-          prompt, so this is deliberately slow.
+          Prefill then cached decode, running in a Web Worker. The spinner is driven by
+          the main thread — if it keeps moving, the GPU work is genuinely off-thread.
         </p>
         <div class="row">
           <input id="prompt" type="text" value="The capital of France is" />
           <label class="muted" for="max-tokens">tokens</label>
-          <input id="max-tokens" type="number" value="20" min="1" max="128" />
+          <input id="max-tokens" type="number" value="40" min="1" max="256" />
           <button id="run-generate" type="button">Generate</button>
+          <button id="cancel-generate" type="button" class="secondary" disabled>Stop</button>
+          <span id="spinner" aria-hidden="true"></span>
         </div>
         <p id="generate-out" class="mono"></p>
         <p id="generate-stats" class="muted mono"></p>
