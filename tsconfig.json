@@ -13,6 +13,7 @@
     "noUncheckedIndexedAccess": false,
     "exactOptionalPropertyTypes": false,
 
+    "resolveJsonModule": true,
     "isolatedModules": true,
     "verbatimModuleSyntax": true,
     "skipLibCheck": true,
