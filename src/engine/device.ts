@@ -145,7 +145,8 @@ export async function requestGpuContext(options: RequestDeviceOptions = {}): Pro
   return {
     adapter,
     device,
-    info: adapter.info,
+    // adapter.info is a recent addition; older implementations expose nothing here.
+    info: adapter.info ?? ({} as GPUAdapterInfo),
     limits: Object.freeze(limitsFrom(device.limits)),
     features,
     hasF16: device.features.has('shader-f16'),
