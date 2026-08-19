@@ -1,16 +1,27 @@
 /**
- * M0 dev surface: negotiate a device, show what we were granted, and run the one
- * kernel that exists against its CPU reference so a machine can be checked without
- * running the test suite.
+ * Dev surface: negotiate a device, show what we were granted, load the converted model
+ * with a real progress bar, and run the kernels that exist against their CPU references
+ * so a machine can be characterised without running the test suite.
  *
  * This page is replaced by the chat UI at M4; the limits panel folds into the perf
  * panel at M5.
  */
 
-import { describeContext, requestGpuContext, WebGpuUnavailableError } from '../engine/device.js';
+import {
+  describeContext,
+  requestGpuContext,
+  WebGpuUnavailableError,
+  type GpuContext,
+} from '../engine/device.js';
 import { PipelineCache } from '../engine/pipelines.js';
 import { runMatvecF32 } from '../engine/kernels.js';
 import { matvecF32, matvecF64 } from '../reference/cpu.js';
+import { ModelStore, type LoadProgress } from '../engine/store.js';
+import { loadModel, type LoadedModel } from '../engine/model.js';
+
+/** Which converted model the dev page loads. Produced by tools/convert.py. */
+const MODEL_ID = 'qwen2.5-0.5b-instruct';
+const MODEL_BASE = new URL(`/models/${MODEL_ID}/`, location.href).href;
 
 const SELF_CHECK_SHAPES: Array<{ m: number; n: number }> = [
   { m: 3, n: 7 },
@@ -166,6 +177,116 @@ async function main(): Promise<void> {
     }
     tbody.append(row);
   }
+
+  await setUpModelPanel(ctx);
+}
+
+// ---------------------------------------------------------------------------------------
+// model loading panel
+// ---------------------------------------------------------------------------------------
+
+const MIB_BYTES = 1024 * 1024;
+
+function formatBytes(bytes: number): string {
+  if (bytes >= MIB_BYTES) return `${(bytes / MIB_BYTES).toFixed(1)} MiB`;
+  if (bytes >= 1024) return `${(bytes / 1024).toFixed(1)} KiB`;
+  return `${bytes} B`;
+}
+
+function formatMs(ms: number): string {
+  return ms >= 1000 ? `${(ms / 1000).toFixed(2)} s` : `${ms.toFixed(0)} ms`;
+}
+
+async function setUpModelPanel(ctx: GpuContext): Promise<void> {
+  const section = show('model');
+  const loadButton = el<HTMLButtonElement>('load-model');
+  const clearButton = el<HTMLButtonElement>('clear-cache');
+  const status = el('model-status');
+  const progressWrap = el('progress-wrap');
+  const fill = el('progress-fill');
+  const label = el('progress-label');
+  const body = el('model-body');
+
+  let loaded: LoadedModel | null = null;
+
+  const describeCache = async (): Promise<void> => {
+    const store = await ModelStore.open(MODEL_ID);
+    const bytes = await store.usageBytes();
+    status.textContent = bytes > 0 ? `${formatBytes(bytes)} cached in OPFS` : 'not cached';
+  };
+
+  const onProgress = (p: LoadProgress): void => {
+    progressWrap.hidden = false;
+    const fraction = p.totalBytes > 0 ? p.loadedBytes / p.totalBytes : 0;
+    fill.style.width = `${(fraction * 100).toFixed(2)}%`;
+    // Real byte counts, not a synthetic ramp -- these are the numbers the loader moved.
+    const source = p.phase === 'download' ? (p.fromCache ? 'cache' : 'network') : 'GPU';
+    label.textContent =
+      `${p.phase} (${source})  ${formatBytes(p.loadedBytes)} / ${formatBytes(p.totalBytes)}  ` +
+      `${(fraction * 100).toFixed(1)}%  ${p.detail}`;
+  };
+
+  loadButton.addEventListener('click', async () => {
+    loadButton.disabled = true;
+    clearButton.disabled = true;
+    body.hidden = true;
+    status.textContent = 'loading…';
+    try {
+      loaded?.weights.destroy();
+      loaded = await loadModel(ctx.device, {
+        baseUrl: MODEL_BASE,
+        modelId: MODEL_ID,
+        onProgress,
+      });
+      const { stats, config } = loaded;
+      fill.style.width = '100%';
+      status.textContent = stats.servedFromCache ? 'loaded from OPFS' : 'downloaded and cached';
+
+      defineList(body, [
+        ['served from', stats.servedFromCache ? 'OPFS cache' : 'network'],
+        ['fetch', `${formatMs(stats.downloadMs)}  (${formatBytes(stats.networkBytes)} network, ${formatBytes(stats.cacheBytes)} cache)`],
+        ['GPU upload', formatMs(stats.uploadMs)],
+        ['total', formatMs(stats.totalMs)],
+        ['tensors / buffers', `${stats.tensorCount} / ${stats.bufferCount}`],
+        ['VRAM', formatBytes(stats.vramBytes)],
+        ['chunks', String(stats.chunkCount)],
+        ['architecture', `${config.modelType}, ${config.numHiddenLayers} layers`],
+        ['hidden / intermediate', `${config.hiddenSize} / ${config.intermediateSize}`],
+        ['heads (Q / KV)', `${config.numAttentionHeads} / ${config.numKeyValueHeads} (${config.queryHeadsPerKvHead} per KV)`],
+        ['head_dim', String(config.headDim)],
+        ['vocab', config.vocabSize.toLocaleString()],
+        ['rope_theta', String(config.ropeTheta)],
+        ['rms_norm_eps', String(config.rmsNormEps)],
+        ['tied embeddings', config.tieWordEmbeddings ? 'yes' : 'no'],
+      ]);
+      body.hidden = false;
+    } catch (err) {
+      status.textContent = '';
+      label.textContent = '';
+      const p = document.createElement('p');
+      p.className = 'bad';
+      p.textContent = `Load failed: ${String(err)}`;
+      section.append(p);
+    } finally {
+      loadButton.disabled = false;
+      clearButton.disabled = false;
+    }
+  });
+
+  clearButton.addEventListener('click', async () => {
+    clearButton.disabled = true;
+    loaded?.weights.destroy();
+    loaded = null;
+    body.hidden = true;
+    progressWrap.hidden = true;
+    fill.style.width = '0';
+    const store = await ModelStore.open(MODEL_ID);
+    await store.clear();
+    await describeCache();
+    clearButton.disabled = false;
+  });
+
+  await describeCache();
 }
 
 void main();

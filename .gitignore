@@ -3,10 +3,13 @@ dist/
 .DS_Store
 *.log
 
-# Converted model weights (M1) -- large binaries, produced by tools/convert.py
+# Raw HF downloads and converted weights (M1). The real model is ~1 GB each way.
 /models/
-*.bin
+/public/models/*
 *.safetensors
+
+# ...except the few-KB synthetic model the fast loader tests run against.
+!/public/models/tiny-test/
 
 # Golden dumps (M2) -- regenerate with tools/golden.py
 /tests/golden/
