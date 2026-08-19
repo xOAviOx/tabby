@@ -18,6 +18,9 @@ import { runMatvecF32 } from '../engine/kernels.js';
 import { matvecF32, matvecF64 } from '../reference/cpu.js';
 import { ModelStore, type LoadProgress } from '../engine/store.js';
 import { loadModel, type LoadedModel } from '../engine/model.js';
+import { ForwardPass } from '../engine/forward.js';
+import { generateGreedy } from '../engine/sampler.js';
+import { BpeTokenizer } from '../tokenizer/bpe.js';
 
 /** Which converted model the dev page loads. Produced by tools/convert.py. */
 const MODEL_ID = 'qwen2.5-0.5b-instruct';
@@ -260,6 +263,7 @@ async function setUpModelPanel(ctx: GpuContext): Promise<void> {
         ['tied embeddings', config.tieWordEmbeddings ? 'yes' : 'no'],
       ]);
       body.hidden = false;
+      await setUpGeneration(ctx, loaded);
     } catch (err) {
       status.textContent = '';
       label.textContent = '';
@@ -287,6 +291,76 @@ async function setUpModelPanel(ctx: GpuContext): Promise<void> {
   });
 
   await describeCache();
+}
+
+// ---------------------------------------------------------------------------------------
+// generation panel
+// ---------------------------------------------------------------------------------------
+
+let generationReady = false;
+
+async function setUpGeneration(ctx: GpuContext, model: LoadedModel): Promise<void> {
+  const section = show('generate');
+  if (generationReady) return;
+  generationReady = true;
+
+  const promptInput = el<HTMLInputElement>('prompt');
+  const maxTokensInput = el<HTMLInputElement>('max-tokens');
+  const button = el<HTMLButtonElement>('run-generate');
+  const out = el('generate-out');
+  const stats = el('generate-stats');
+
+  stats.textContent = 'compiling kernels…';
+  const tokenizer = await BpeTokenizer.fromUrl(new URL('tokenizer.json', MODEL_BASE).href);
+  const forward = await ForwardPass.create(
+    ctx.device,
+    model,
+    new PipelineCache(ctx.device),
+    { maxTokens: 256 },
+  );
+  stats.textContent = 'ready';
+  void section;
+
+  button.addEventListener('click', async () => {
+    button.disabled = true;
+    const prompt = promptInput.value;
+    const maxNewTokens = Math.max(1, Math.min(128, Number(maxTokensInput.value) || 20));
+
+    const promptSpan = document.createElement('span');
+    promptSpan.className = 'prompt';
+    promptSpan.textContent = prompt;
+    const outputSpan = document.createElement('span');
+    out.replaceChildren(promptSpan, outputSpan);
+    stats.textContent = 'generating…';
+
+    try {
+      const ids = tokenizer.encode(prompt);
+      const produced: number[] = [];
+      const result = await generateGreedy(
+        ids,
+        async (sequence) => (await forward.run(sequence)).logits,
+        {
+          maxNewTokens,
+          stopTokens: model.config.eosTokenIds,
+          onToken: (id) => {
+            produced.push(id);
+            // Decoded from scratch each step: a multi-byte character is often split
+            // across tokens, so decoding incrementally would emit replacement chars.
+            outputSpan.textContent = tokenizer.decode(produced, { skipSpecialTokens: true });
+          },
+        },
+      );
+      const tokPerSec = (result.tokens.length / result.ms) * 1000;
+      stats.textContent =
+        `${result.tokens.length} tokens in ${(result.ms / 1000).toFixed(2)} s ` +
+        `(${tokPerSec.toFixed(2)} tok/s, greedy, no KV cache)` +
+        (result.stopped ? ' — stopped at EOS' : '');
+    } catch (err) {
+      stats.textContent = `generation failed: ${String(err)}`;
+    } finally {
+      button.disabled = false;
+    }
+  });
 }
 
 void main();

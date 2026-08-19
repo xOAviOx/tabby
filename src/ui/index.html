@@ -53,6 +53,22 @@
         <dl id="model-body" class="kv" hidden></dl>
       </section>
 
+      <section id="generate" class="card" hidden>
+        <h2>Generation</h2>
+        <p class="muted">
+          Greedy decoding, no KV cache — the M2 baseline. Every token re-runs the whole
+          prompt, so this is deliberately slow.
+        </p>
+        <div class="row">
+          <input id="prompt" type="text" value="The capital of France is" />
+          <label class="muted" for="max-tokens">tokens</label>
+          <input id="max-tokens" type="number" value="20" min="1" max="128" />
+          <button id="run-generate" type="button">Generate</button>
+        </div>
+        <p id="generate-out" class="mono"></p>
+        <p id="generate-stats" class="muted mono"></p>
+      </section>
+
       <section id="selfcheck" class="card" hidden>
         <h2>Kernel self-check</h2>
         <p class="muted">

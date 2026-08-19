@@ -195,3 +195,37 @@ button:disabled {
 #progress-label {
   margin: 0.5rem 0 0;
 }
+
+input[type='text'] {
+  flex: 1 1 18rem;
+  min-width: 12rem;
+}
+
+input[type='number'] {
+  width: 5rem;
+}
+
+input {
+  font: inherit;
+  font-size: 0.875rem;
+  padding: 0.4rem 0.6rem;
+  border-radius: 7px;
+  border: 1px solid var(--line);
+  background: var(--bg);
+  color: var(--fg);
+}
+
+#generate-out {
+  min-height: 3rem;
+  margin: 0.25rem 0 0.5rem;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+#generate-out .prompt {
+  color: var(--muted);
+}
+
+#generate-stats {
+  margin: 0;
+}
