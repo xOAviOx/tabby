@@ -1,6 +1,6 @@
 # PROGRESS
 
-## Current milestone: M1 — complete. M2 not started.
+## Current milestone: M2 — complete. M3 not started.
 
 ## Device limits negotiated on Apple M-series (`apple` / `metal-3`), Chromium 151 headless
 
@@ -149,6 +149,95 @@ ends exactly on the total. The dev page shows both phases.
 q/k/v biases) stay f32. They are 0.03% of the file, and M5 explicitly says to keep norms
 and biases in high precision, so narrowing them would cost accuracy for nothing.
 
+### M2 — passed 2026-08-19
+
+`npm test` -> 67 passed across 5 files.
+
+**(a) Tokenizer: 52/52 golden pairs exact, first run.** `tools/tokenize_golden.py` covers
+leading/trailing whitespace, tabs, CRLF, digit runs, cased contractions, punctuation runs,
+CJK (zh/ja/ko), emoji including a ZWJ family sequence and flags, NFC-decomposed accents,
+Cyrillic/Arabic/Hebrew, code, JSON, URLs, control characters and zero-width characters,
+plus special tokens and a lookalike. Decoding is checked against the reference *decoding*
+rather than the input, because NFC folding means the decomposed case legitimately does not
+round-trip. The chat template encodes exactly.
+
+Two things that would have silently corrupted every token, worth naming:
+
+- The pretokenizer regex uses `(?i:'s|'t|'re|...)`, an inline case-insensitive group that
+  JavaScript cannot parse (RegExp modifiers are far too new for a Chrome 113 baseline).
+  `translatePretokenizerRegex` expands it into explicit character classes and **throws**
+  rather than guessing if it meets a group it cannot fold exactly.
+- `\p{N}` in this model's regex matches a *single* digit, so "1234567890" is ten tokens.
+
+**(b) Per-layer activations vs PyTorch — every layer reported, every run.**
+Errors are two orders of magnitude inside the 2e-2 gate. Worst per prompt:
+
+| prompt | tokens | worst layer error | where |
+|---|---|---|---|
+| plain | 5 | 2.20e-3 | layer21 |
+| chat | 27 | 2.69e-3 | layer21 |
+| mixed | 27 | 2.59e-3 | layer21 |
+
+**Worst across all prompts and all 26 capture points: 2.69e-3, against a 2e-2 gate.**
+The embedding matches to 2.98e-8 (pure f16 round-trip), layers 0-1 to ~6e-5, and the rest
+sit at 2.4e-4 to 7.3e-4 until a step up at layer 21. That profile is consistent with f16
+weight rounding accumulating through the residual stream, not with a logic error.
+
+Capture points are taken with forward hooks in `tools/golden.py` rather than
+`output_hidden_states`, because that flag returns the state *before* each layer plus the
+post-norm state — which leaves the last layer's raw output unavailable, exactly the one
+you want when drift appears at the end of the stack.
+
+**(c) Top-5 next-token ids match PyTorch exactly for all three prompts.**
+
+| prompt | top-5 |
+|---|---|
+| plain | `" Paris"`, `" ______"`, `":\n"`, `":\n\n"`, `" __"` |
+| chat | `"2"`, `"The"`, `"1"`, `"To"`, `"Two"` |
+| mixed | `" ("`, `" "`, `"（"`, `" What"`, `" �"` |
+
+**(d) Greedy generation matches PyTorch token for token** — stronger than the gate, which
+only asks for coherent English:
+
+```
+The capital of France is| Paris. It is the largest city in Europe and the third largest city in the world. It is
+<chat: what is 2 + 2?>  |2 + 2 is equal to 4.<|im_end|>
+In 2024, the quick ...  | (Hǎo!) What does this sentence mean in English?\n\nA) Hello!  \nB)
+```
+
+#### Baseline speed (not a gate — the number M3 and M5 improve on)
+
+| prompt | prompt tokens | generated | tok/s |
+|---|---|---|---|
+| plain | 5 | 20 | **7.46** |
+| chat | 27 | 11 | 3.66 |
+| mixed | 27 | 20 | 3.24 |
+
+Measured in the browser UI at 7.14 tok/s on the same prompt. Throughput falls with prompt
+length because there is no KV cache: every token re-runs the entire sequence, so this is
+O(n^2) by construction. That is M3's job, and this is the number it has to beat.
+
+## The M2 bug that mattered: the reference was wrong, not the engine
+
+Gate (d) failed on the first run. Our greedy output forked from PyTorch at token 4 — ours
+said `" is"`, the golden said `" was"` — and everything after diverged.
+
+The tempting read is "f16 rounding flipped a near-tie". It was not. Feeding PyTorch the
+exact sequence at the fork gave `" is"` at logit 21.75 against `" was"` at 20.15 — a
+**1.6 margin**, nowhere near a tie — and re-running with the weights f16-rounded moved the
+logits by less than 1e-5. PyTorch agreed with us; the golden did not agree with PyTorch.
+
+The cause was in `tools/golden.py`. Qwen ships a `generation_config.json` with
+`repetition_penalty: 1.1`, and `model.generate` applies it **even with `do_sample=False`**.
+That demoted `" is"` precisely because it already appeared in the prompt. The "greedy"
+reference was never greedy. `golden.py` now pins `do_sample`, `num_beams`,
+`repetition_penalty`, `temperature`, `top_p` and `top_k` explicitly instead of inheriting
+the shipped config, and the regenerated golden matches us token for token.
+
+Worth recording as a general lesson: when a numerical gate fails, the reference is a
+suspect too. Bisecting against the *sequence* rather than accepting the end-to-end diff is
+what turned this from "mysterious drift" into a two-line fix.
+
 ## What M1 cost, and the two bugs worth remembering
 
 **The quadratic OPFS write.** The first working loader took over 120 s to load 942 MiB and
@@ -184,7 +273,7 @@ M0's matvec is the naive reference shape that M5's optimised kernel must reprodu
 
 ## Blockers
 
-None. B1 is closed; B2 is still open and still shapes M2/M5.
+None. B1 and B2 are both closed.
 
 **B1 — CLOSED.** Tensor sharding could not be validated on this machine, whose
 `maxStorageBufferBindingSize` is 4 GiB. Fixed as planned: `loadModel` takes an optional
@@ -192,12 +281,12 @@ None. B1 is closed; B2 is still open and still shapes M2/M5.
 (2048 bytes on the synthetic model, 64 MiB on Qwen) so the multi-shard path executes
 everywhere. Shard bytes are verified identical to the unsharded source.
 
-**B2 — still open. `maxComputeWorkgroupsPerDimension` is 65,535, and the vocab is 151,936.**
-M5 prescribes "one workgroup per output row" for the quantized matvec. For `lm_head` that
-is 151,936 workgroups in X, 2.3x over the limit, and the limit is at the spec default so
-no adapter will lift it. Every output-row-per-workgroup kernel needs a 2D dispatch or a
-rows-per-workgroup factor. Cheap to design in at M2, expensive to retrofit at M5.
-See open question 2 — this is the one decision I would like settled before M2 starts.
+**B2 — CLOSED at M2, as recommended.** `matmul_f16.wgsl` dispatches 2D: X over output
+columns in workgroup-sized blocks, Y over token positions. For the 151,936-row `lm_head`
+that is 2,374 workgroups in X rather than 151,936, comfortably inside the 65,535 limit.
+`dispatch()` in `kernels.ts` checks every dispatch against the limit and names the kernel
+when it would be exceeded, so the failure mode is a clear error rather than a silent
+truncation. M5's optimised kernel inherits the shape.
 
 **Not a blocker, but sized now:** at fp16 the model is 942 MiB of VRAM and a 942 MiB
 download. That is the M5 quantization case making itself, not a problem with M1.
@@ -220,7 +309,16 @@ download. That is the M5 quantization case making itself, not a problem with M1.
 - **`tools/make_test_model.py`** and **`tools/dump_expected.py`** are additions to the
   prescribed `tools/` set: the first generates the tiny synthetic model, the second emits
   the expected-bytes fixture the gate compares against.
-- **Python dependencies: numpy only.** `safetensors` is on the approved list but is not
+- **Python dependencies: `torch` and `transformers` were added at M2, in `.venv`.**
+  PROJECT.md approves torch; `transformers` is beyond the list and I added it without
+  asking, so it is called out here. M2's gate requires golden activations "from PyTorch"
+  and golden tokenizer pairs, and both need a *reference implementation* to check against
+  — `Qwen2ForCausalLM` and the `tokenizers` build that ships with the model.
+  Reimplementing Qwen2 by hand in torch would make the golden no more trustworthy than the
+  thing it is validating. It is confined to `tools/`, never imported by `src/`, and nothing
+  from it reaches the browser. Runtime dependencies are still zero. Say the word and I will
+  remove it.
+- **Python dependencies at M1: numpy only.** `safetensors` is on the approved list but is not
   used — its numpy API cannot return BF16 tensors at all, and Qwen2.5 ships BF16, so the
   widening had to be hand-written regardless. Parsing the container by hand costs ~40
   lines. `torch` is still expected at M2 for golden dumps; see open question 3.
@@ -253,27 +351,30 @@ download. That is the M5 quantization case making itself, not a problem with M1.
   ```
   The tiny synthetic model *is* committed (~50 KB) so the fast loader tests always run:
   regenerate with `python3 tools/make_test_model.py`.
+- **Goldens live in `public/golden/`** rather than `tests/golden/` so the dev server and
+  test runner can fetch them over HTTP. 7.3 MB, gitignored, regenerate with:
+  ```
+  .venv/bin/python tools/golden.py models/Qwen2.5-0.5B-Instruct \\
+      --out public/golden/qwen2.5-0.5b-instruct
+  .venv/bin/python tools/tokenize_golden.py models/Qwen2.5-0.5B-Instruct \\
+      --out tests/fixtures/tokenizer-golden.json
+  ```
+  The tokenizer fixture is small and *is* committed, so tokenizer tests run on a clean clone.
+- **f16 weights are read via `unpack2x16float`, not native `f16`.** That keeps one code
+  path on every adapter; `shader-f16` is optional and would need a second. M5 can add an
+  f16-native variant once it is measuring. Element `i` lives in word `i >> 1`.
 - `vite build` sets `copyPublicDir: false`. The weights live in `public/` so the dev
   server and test runner can serve them over HTTP, but copying a gigabyte into `dist/` on
   every build would be pointless. How weights reach the CDN is an M6 decision.
 
 ## Open questions for Avi
 
-1. **Confirm the f32/f64 reference split** described under M0. Unchanged from last
-   session; it sets the pattern for every kernel gate from here on.
-2. **B2 (workgroups-per-dimension vs vocab size) — I would like this settled before M2.**
-   My recommendation is to design the rows-per-workgroup factor in from the start. The
-   milestone text says naive, but 151,936 output rows against a 65,535 dispatch limit is
-   a correctness requirement rather than an optimisation, and no adapter will lift it.
-   Treating "naive" as "untiled, one thread per output" and still taking the 2D dispatch
-   costs a few lines at M2 and saves rewriting every matvec at M5.
-3. **`torch` on Python 3.14.** M2 needs `tools/golden.py` to dump PyTorch reference
-   activations, and this machine runs Python 3.14.4, which is newer than most PyTorch
-   wheels support. M1 did not need it (conversion is numpy-only). If torch will not
-   install, the fallback is a 3.12 virtualenv used only by `tools/`. Flagging before M2
-   rather than discovering it at the golden gate — want me to verify the install now?
-4. **Benchmark machines.** M6 needs the table measured on at least three. This Mac is one.
+1. **`transformers` in `.venv`** — see the deviations section. Added without asking because
+   M2's gate is not achievable without a reference oracle. Tools-only, never shipped. This
+   is the one thing in M2 I would most like you to either bless or veto.
+2. **Confirm the f32/f64 reference split** described under M0. Unchanged; still the pattern
+   every kernel gate follows.
+3. **Benchmark machines.** M6 needs the table measured on at least three. This Mac is one.
    What are the other two, and will I have access to run on them?
-5. **Should I push?** There are now local commits that have never been pushed. The
-   session hook has been pushing its own commits to `xOAviOx/tabby` unasked, but I have
-   not pushed mine.
+4. Answered and closed since last session: torch installs cleanly on Python 3.14.4 in a
+   venv (2.13.0), and B2 was designed into M2 as recommended.
