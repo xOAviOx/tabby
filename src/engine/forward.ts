@@ -19,11 +19,13 @@
  * device where the embedding and lm_head must split.
  */
 
-import { BufferArena, readF32 } from './buffers.js';
+import { BufferArena, readBuffer, readF32 } from './buffers.js';
 import { withErrorScopes } from './device.js';
 import { KvCache, type KvCacheOptions } from './kvcache.js';
 import {
   MATMUL_TILE_T,
+  MAX_TOP_K,
+  REDUCE_GROUPS,
   createKernels,
   dispatch,
   groupsFor,
@@ -32,6 +34,16 @@ import {
 } from './kernels.js';
 import { bindGroup, type PipelineCache } from './pipelines.js';
 import type { GpuTensor, LoadedModel, ModelConfig, WeightRegistry } from './model.js';
+
+/** Narrow a result to its logits, failing loudly if the run sampled on the GPU instead. */
+export function requireLogits(result: ForwardResult): Float32Array<ArrayBufferLike> {
+  if (!result.logits) {
+    throw new ForwardError(
+      'this run requested topK, so the full logit vector was never read back',
+    );
+  }
+  return result.logits;
+}
 
 export class ForwardError extends Error {
   constructor(message: string) {
@@ -54,18 +66,43 @@ export interface ForwardPassOptions {
 export interface RunOptions {
   /** Capture the embedding output, every layer output and the final norm. */
   captureActivations?: boolean;
+  /**
+   * Compute the top-k candidates on the GPU and read back only those, instead of the
+   * whole logit vector. At a 152k vocabulary the difference is ~330 bytes against
+   * ~608 KB per token, which is the entire point of M4's readback rule.
+   */
+  topK?: number;
+}
+
+/** The k highest logits, plus what is needed to turn them into exact probabilities. */
+export interface TopKResult {
+  /** Largest logit over the full vocabulary. */
+  maxLogit: number;
+  /** sum(exp(x - maxLogit)) over the full vocabulary: the softmax denominator. */
+  sumExp: number;
+  /** Candidate ids, highest logit first. */
+  ids: number[];
+  /** Their raw logits, aligned with `ids`. */
+  logits: number[];
 }
 
 export interface ForwardResult {
-  /** Logits at the final position of this segment. */
-  logits: Float32Array;
+  /** Logits at the final position. Null when `topK` was requested instead. */
+  logits: Float32Array | null;
+  topK: TopKResult | null;
   /** Present when captureActivations was set: [embed, layer0..layerN-1, finalNorm]. */
   activations: Float32Array[] | null;
   nTokens: number;
   ms: number;
+  /** Bytes copied GPU -> CPU by this call. The M4 gate asserts on this. */
+  readbackBytes: number;
 }
 
 const DEFAULT_MAX_SEQ_LEN = 512;
+
+/** [maxLogit, sumExp, (value, index) * MAX_TOP_K] */
+const SAMPLE_HEADER_FLOATS = 2;
+const SAMPLE_OUT_FLOATS = SAMPLE_HEADER_FLOATS + MAX_TOP_K * 2;
 
 type UniformFn = (data: ArrayBuffer, label: string) => GPUBuffer;
 
@@ -77,6 +114,23 @@ interface Segment {
   posStart: number;
   /** posStart + nNew. */
   totalLen: number;
+}
+
+/**
+ * Unpack [maxLogit, sumExp, (value, index) * k]. The index is a u32 written through an
+ * f32 array, so the same bytes are read twice with different views.
+ */
+function decodeSampleBlock(raw: ArrayBuffer, k: number): TopKResult {
+  const asFloat = new Float32Array(raw);
+  const asUint = new Uint32Array(raw);
+  const ids: number[] = [];
+  const logits: number[] = [];
+  for (let i = 0; i < k; i++) {
+    const slot = SAMPLE_HEADER_FLOATS + i * 2;
+    ids.push(asUint[slot + 1]);
+    logits.push(asFloat[slot]);
+  }
+  return { maxLogit: asFloat[0], sumExp: asFloat[1], ids, logits };
 }
 
 export class ForwardPass {
@@ -104,6 +158,10 @@ export class ForwardPass {
   private readonly logits: GPUBuffer;
   private readonly noBias: GPUBuffer;
   private readonly capture: GPUBuffer;
+  private readonly logitsWork: GPUBuffer;
+  private readonly partialsValue: GPUBuffer;
+  private readonly partialsIndex: GPUBuffer;
+  private readonly sampleOut: GPUBuffer;
 
   private constructor(
     device: GPUDevice,
@@ -146,6 +204,13 @@ export class ForwardPass {
     // the shader never reads it.
     this.noBias = alloc(4, 'fwd.noBias');
     this.capture = alloc((c.numHiddenLayers + 2) * n * c.hiddenSize, 'fwd.capture');
+
+    // Sampling scratch. `work` is a maskable copy of the logits, so extracting the top-k
+    // never disturbs the originals the softmax statistics are computed from.
+    this.logitsWork = alloc(c.vocabSize, 'fwd.logitsWork');
+    this.partialsValue = alloc(REDUCE_GROUPS, 'fwd.partialsValue');
+    this.partialsIndex = alloc(REDUCE_GROUPS, 'fwd.partialsIndex');
+    this.sampleOut = alloc(SAMPLE_OUT_FLOATS, 'fwd.sampleOut');
   }
 
   static async create(
@@ -184,14 +249,13 @@ export class ForwardPass {
     const nNew = tokenIds.length;
     if (nNew === 0) throw new ForwardError('cannot run a forward pass on zero tokens');
     const posStart = this.cache.reserve(nNew);
-    return this.runSegment(tokenIds, posStart, options.captureActivations ?? false);
+    return this.runSegment(tokenIds, posStart, options);
   }
 
   /** Process a single token at the cache's current position. */
-  async decode(tokenId: number): Promise<Float32Array> {
+  async decode(tokenId: number, options: RunOptions = {}): Promise<ForwardResult> {
     const posStart = this.cache.reserve(1);
-    const result = await this.runSegment([tokenId], posStart, false);
-    return result.logits;
+    return this.runSegment([tokenId], posStart, options);
   }
 
   /** Reset the cache and process the whole sequence. This is the M2 behaviour. */
@@ -207,9 +271,14 @@ export class ForwardPass {
   private async runSegment(
     tokenIds: ArrayLike<number>,
     posStart: number,
-    capture: boolean,
+    options: RunOptions,
   ): Promise<ForwardResult> {
     const c = this.config;
+    const capture = options.captureActivations ?? false;
+    const topK = options.topK ?? 0;
+    if (topK < 0 || topK > MAX_TOP_K) {
+      throw new ForwardError(`topK must be between 0 and ${MAX_TOP_K}, got ${topK}`);
+    }
     const nNew = tokenIds.length;
     const segment: Segment = { nNew, posStart, totalLen: posStart + nNew };
     const started = performance.now();
@@ -288,15 +357,32 @@ export class ForwardPass {
         );
         headPass.end();
 
+        if (topK > 0) this.encodeSampling(encoder, uniform, topK);
+
         this.device.queue.submit([encoder.finish()]);
       });
 
-      const logits = await readF32(this.device, this.logits, c.vocabSize);
+      let logits: Float32Array<ArrayBufferLike> | null = null;
+      let topKResult: TopKResult | null = null;
+      let readbackBytes = 0;
+
+      if (topK > 0) {
+        // The only thing crossing to the CPU is this block.
+        const floats = SAMPLE_HEADER_FLOATS + topK * 2;
+        const raw = await readBuffer(this.device, this.sampleOut, floats * 4);
+        readbackBytes += floats * 4;
+        topKResult = decodeSampleBlock(raw, topK);
+      } else {
+        logits = await readF32(this.device, this.logits, c.vocabSize);
+        readbackBytes += c.vocabSize * 4;
+      }
 
       let activations: Float32Array[] | null = null;
       if (capture) {
         const slots = c.numHiddenLayers + 2;
-        const all = await readF32(this.device, this.capture, slots * this.maxSeqLen * c.hiddenSize);
+        const captureFloats = slots * this.maxSeqLen * c.hiddenSize;
+        const all = await readF32(this.device, this.capture, captureFloats);
+        readbackBytes += captureFloats * 4;
         activations = [];
         for (let slot = 0; slot < slots; slot++) {
           const base = slot * this.maxSeqLen * c.hiddenSize;
@@ -304,7 +390,14 @@ export class ForwardPass {
         }
       }
 
-      return { logits, activations, nTokens: nNew, ms: performance.now() - started };
+      return {
+        logits,
+        topK: topKResult,
+        activations,
+        nTokens: nNew,
+        ms: performance.now() - started,
+        readbackBytes,
+      };
     } finally {
       perCall.destroy();
     }
@@ -313,6 +406,96 @@ export class ForwardPass {
   // -------------------------------------------------------------------------------------
   // encoding helpers
   // -------------------------------------------------------------------------------------
+
+  /**
+   * Softmax statistics plus an exact top-k, entirely on the GPU.
+   *
+   * k rounds of (per-workgroup max, then reduce-and-mask) extract the k largest logits
+   * in order. It is more dispatches than a histogram or partial sort, but each round is
+   * a plain memory-bound pass over 608 KB that never leaves the device, and the result
+   * is exact rather than approximate.
+   */
+  private encodeSampling(
+    encoder: GPUCommandEncoder,
+    uniform: UniformFn,
+    topK: number,
+  ): void {
+    const c = this.config;
+    const vocab = c.vocabSize;
+
+    // Mask the copy, not the originals: the softmax denominator below needs them intact.
+    encoder.copyBufferToBuffer(this.logits, 0, this.logitsWork, 0, vocab * 4);
+    const pass = encoder.beginComputePass({ label: 'sample' });
+
+    const reduce = (
+      pipeline: GPUComputePipeline,
+      dims: ArrayBuffer,
+      buffers: GPUBuffer[],
+      groups: number,
+      label: string,
+    ): void => {
+      const group = bindGroup(
+        this.device,
+        pipeline,
+        [uniform(dims, `${label}.dims`), ...buffers],
+        `${label}.bind`,
+      );
+      dispatch(pass, pipeline, group, this.device.limits, [groups], label);
+    };
+
+    // max over the full vocabulary, in two stages.
+    reduce(
+      this.kernels.reduceMax,
+      uniforms.reduceMax(vocab, 0),
+      [this.logits, this.partialsValue],
+      REDUCE_GROUPS,
+      'reduce_max.partial',
+    );
+    reduce(
+      this.kernels.reduceMax,
+      uniforms.reduceMax(REDUCE_GROUPS, 0),
+      [this.partialsValue, this.sampleOut],
+      1,
+      'reduce_max.final',
+    );
+
+    // sum(exp(x - max)). Stage two binds `stats` to partialsValue purely to avoid
+    // aliasing sampleOut as both readable and writable in one bind group; apply_exp is
+    // off there, so the value is never read.
+    reduce(
+      this.kernels.reduceSumExp,
+      uniforms.reduceSumExp(vocab, 0, true, 0),
+      [this.logits, this.partialsValue, this.sampleOut],
+      REDUCE_GROUPS,
+      'reduce_sumexp.partial',
+    );
+    reduce(
+      this.kernels.reduceSumExp,
+      uniforms.reduceSumExp(REDUCE_GROUPS, 1, false, 0),
+      [this.partialsValue, this.sampleOut, this.partialsValue],
+      1,
+      'reduce_sumexp.final',
+    );
+
+    for (let step = 0; step < topK; step++) {
+      reduce(
+        this.kernels.topkPartial,
+        uniforms.topkPartial(vocab),
+        [this.logitsWork, this.partialsValue, this.partialsIndex],
+        REDUCE_GROUPS,
+        `topk.partial[${step}]`,
+      );
+      reduce(
+        this.kernels.topkSelect,
+        uniforms.topkSelect(REDUCE_GROUPS, step, SAMPLE_HEADER_FLOATS),
+        [this.partialsValue, this.partialsIndex, this.sampleOut, this.logitsWork],
+        1,
+        `topk.select[${step}]`,
+      );
+    }
+
+    pass.end();
+  }
 
   private encodeEmbedding(pass: GPUComputePassEncoder, uniform: UniformFn, nNew: number): void {
     const c = this.config;

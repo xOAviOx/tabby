@@ -23,6 +23,10 @@ import residualAddSource from '../shaders/residual_add.wgsl?raw';
 import siluMulSource from '../shaders/silu_mul.wgsl?raw';
 import kvWriteSource from '../shaders/kv_write.wgsl?raw';
 import matmulF16TiledSource from '../shaders/matmul_f16_tiled.wgsl?raw';
+import reduceMaxSource from '../shaders/reduce_max.wgsl?raw';
+import reduceSumExpSource from '../shaders/reduce_sumexp.wgsl?raw';
+import topkPartialSource from '../shaders/topk_partial.wgsl?raw';
+import topkSelectSource from '../shaders/topk_select.wgsl?raw';
 
 export const DEFAULT_MATVEC_WORKGROUP = 64;
 
@@ -182,6 +186,12 @@ export const uniforms = {
     kvOffset: number,
   ) => packUniform([nNew, totalLen, nHeads, nKvHeads, headDim, posStart, kvOffset]),
   kvWrite: (n: number, dstStart: number) => packUniform([n, dstStart]),
+  reduceMax: (n: number, outIndex: number) => packUniform([n, outIndex]),
+  reduceSumExp: (n: number, outIndex: number, applyExp: boolean, maxIndex: number) =>
+    packUniform([n, outIndex, applyExp ? 1 : 0, maxIndex]),
+  topkPartial: (n: number) => packUniform([n]),
+  topkSelect: (nPartials: number, step: number, outBase: number) =>
+    packUniform([nPartials, step, outBase]),
   elementwise: (n: number) => packUniform([n]),
 };
 
@@ -198,6 +208,10 @@ export interface KernelSet {
   residualAdd: GPUComputePipeline;
   siluMul: GPUComputePipeline;
   kvWrite: GPUComputePipeline;
+  reduceMax: GPUComputePipeline;
+  reduceSumExp: GPUComputePipeline;
+  topkPartial: GPUComputePipeline;
+  topkSelect: GPUComputePipeline;
   workgroupSize: number;
 }
 
@@ -225,6 +239,10 @@ export async function createKernels(
     residualAdd,
     siluMul,
     kvWrite,
+    reduceMax,
+    reduceSumExp,
+    topkPartial,
+    topkSelect,
   ] = await Promise.all([
     build(embedGatherSource, 'embed_gather'),
     build(rmsNormSource, 'rmsnorm'),
@@ -237,6 +255,12 @@ export async function createKernels(
     build(residualAddSource, 'residual_add'),
     build(siluMulSource, 'silu_mul'),
     build(kvWriteSource, 'kv_write'),
+    // The reduction kernels pin their own workgroup size, so the override is irrelevant
+    // to them; passing it anyway would only fragment the pipeline cache.
+    cache.compute({ code: reduceMaxSource, label: 'reduce_max' }),
+    cache.compute({ code: reduceSumExpSource, label: 'reduce_sumexp' }),
+    cache.compute({ code: topkPartialSource, label: 'topk_partial' }),
+    cache.compute({ code: topkSelectSource, label: 'topk_select' }),
   ]);
 
   return {
@@ -251,6 +275,10 @@ export async function createKernels(
     residualAdd,
     siluMul,
     kvWrite,
+    reduceMax,
+    reduceSumExp,
+    topkPartial,
+    topkSelect,
     workgroupSize,
   };
 }
@@ -289,3 +317,9 @@ export function groupsFor(total: number, workgroupSize: number): number {
 
 /** Token positions each tiled-matmul workgroup covers. Must match TILE_T in the shader. */
 export const MATMUL_TILE_T = 4;
+
+/** Partial groups used by the reduction and top-k kernels. */
+export const REDUCE_GROUPS = 256;
+
+/** Largest k the sample-output block is sized for. */
+export const MAX_TOP_K = 64;
