@@ -8,6 +8,8 @@
 
 import type { ModelConfig } from '../engine/model.js';
 import type { LoadProgress } from '../engine/store.js';
+import type { SamplingParams } from '../engine/sampler.js';
+import type { ChatMessage } from '../tokenizer/chat_template.js';
 import type {
   GenerationStats,
   LoadStats,
@@ -26,12 +28,16 @@ export interface LoadedInfo {
   config: ModelConfig;
   stats: LoadStats;
   maxSeqLen: number;
+  hasChatTemplate: boolean;
 }
 
 export interface GenerateOptions {
-  prompt: string;
+  /** Raw completion prompt. Mutually exclusive with `messages`. */
+  prompt?: string;
+  /** Chat turns, rendered through the model's own template. */
+  messages?: ChatMessage[];
   maxNewTokens: number;
-  continueContext?: boolean;
+  sampling: SamplingParams;
   onToken?: (text: string, id: number, index: number) => void;
 }
 
@@ -90,7 +96,12 @@ export class InferenceClient {
         const resolve = this.loadResolve;
         this.loadResolve = null;
         this.loadReject = null;
-        resolve?.({ config: message.config, stats: message.stats, maxSeqLen: message.maxSeqLen });
+        resolve?.({
+          config: message.config,
+          stats: message.stats,
+          maxSeqLen: message.maxSeqLen,
+          hasChatTemplate: message.hasChatTemplate,
+        });
         break;
       }
 
@@ -160,11 +171,10 @@ export class InferenceClient {
     this.send({
       type: 'generate',
       requestId,
-      prompt: options.prompt,
       maxNewTokens: options.maxNewTokens,
-      ...(options.continueContext === undefined
-        ? {}
-        : { continueContext: options.continueContext }),
+      sampling: options.sampling,
+      ...(options.prompt === undefined ? {} : { prompt: options.prompt }),
+      ...(options.messages === undefined ? {} : { messages: options.messages }),
     });
 
     return { done, cancel: () => this.send({ type: 'cancel', requestId }) };

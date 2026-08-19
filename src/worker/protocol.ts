@@ -11,6 +11,8 @@
 
 import type { LoadPhase } from '../engine/store.js';
 import type { ModelConfig } from '../engine/model.js';
+import type { SamplingParams } from '../engine/sampler.js';
+import type { ChatMessage } from '../tokenizer/chat_template.js';
 
 export interface LoadRequest {
   type: 'load';
@@ -22,10 +24,12 @@ export interface LoadRequest {
 export interface GenerateRequest {
   type: 'generate';
   requestId: number;
-  prompt: string;
+  /** Raw completion prompt. Mutually exclusive with `messages`. */
+  prompt?: string;
+  /** Chat turns, rendered through the model's own template from tokenizer_config.json. */
+  messages?: ChatMessage[];
   maxNewTokens: number;
-  /** Continue from the existing KV cache instead of resetting it. */
-  continueContext?: boolean;
+  sampling: SamplingParams;
 }
 
 export interface CancelRequest {
@@ -63,6 +67,8 @@ export interface ReadyResponse {
   config: ModelConfig;
   stats: LoadStats;
   maxSeqLen: number;
+  /** True when the model shipped a chat template we could parse. */
+  hasChatTemplate: boolean;
 }
 
 export interface TokenResponse {
@@ -84,6 +90,14 @@ export interface GenerationStats {
   decodeTokPerSec: number;
   stopped: boolean;
   cancelled: boolean;
+  /**
+   * Bytes copied GPU -> CPU per decode step. The M4 gate requires this to stay small:
+   * reading the full logit vector would be ~608 KB at a 152k vocabulary.
+   */
+  readbackBytesPerToken: number;
+  totalReadbackBytes: number;
+  /** True if top-p ever wanted more probability mass than the top-k pool held. */
+  poolExhausted: boolean;
 }
 
 export interface StatsResponse {
