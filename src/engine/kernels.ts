@@ -27,6 +27,9 @@ import reduceMaxSource from '../shaders/reduce_max.wgsl?raw';
 import reduceSumExpSource from '../shaders/reduce_sumexp.wgsl?raw';
 import topkPartialSource from '../shaders/topk_partial.wgsl?raw';
 import topkSelectSource from '../shaders/topk_select.wgsl?raw';
+import matvecQ4Source from '../shaders/matvec_q4.wgsl?raw';
+import embedGatherQ4Source from '../shaders/embed_gather_q4.wgsl?raw';
+import swigluQ4Source from '../shaders/swiglu_q4.wgsl?raw';
 
 export const DEFAULT_MATVEC_WORKGROUP = 64;
 
@@ -192,6 +195,24 @@ export const uniforms = {
   topkPartial: (n: number) => packUniform([n]),
   topkSelect: (nPartials: number, step: number, outBase: number) =>
     packUniform([nPartials, step, outBase]),
+  matvecQuant: (
+    nTokens: number,
+    nRows: number,
+    nCols: number,
+    blockSize: number,
+    hasBias: boolean,
+    rowStart: number,
+    outStride: number,
+  ) => packUniform([nTokens, nRows, nCols, blockSize, hasBias ? 1 : 0, rowStart, outStride]),
+  swigluQuant: (nTokens: number, nRows: number, nCols: number, blockSize: number) =>
+    packUniform([nTokens, nRows, nCols, blockSize]),
+  embedGatherQuant: (
+    nTokens: number,
+    hidden: number,
+    blockSize: number,
+    rowStart: number,
+    rowCount: number,
+  ) => packUniform([nTokens, hidden, blockSize, rowStart, rowCount]),
   elementwise: (n: number) => packUniform([n]),
 };
 
@@ -212,17 +233,38 @@ export interface KernelSet {
   reduceSumExp: GPUComputePipeline;
   topkPartial: GPUComputePipeline;
   topkSelect: GPUComputePipeline;
+  matvecQ4: GPUComputePipeline;
+  /**
+   * matvec_q4 built for several rows-per-workgroup values. A matrix with few output rows
+   * launches too few workgroups at a large value and leaves the GPU idle; one with many
+   * rows exceeds the dispatch limit at a small one. The caller picks per matmul.
+   */
+  matvecQ4Variants: Map<number, GPUComputePipeline>;
+  swigluQ4: GPUComputePipeline;
+  embedGatherQ4: GPUComputePipeline;
   workgroupSize: number;
+  rowsPerWorkgroup: number;
 }
 
 /**
  * Build every pipeline once. Shader compilation is far too slow to sit anywhere near
  * the generation loop, so this runs at load and the result is held for the session.
  */
+export interface KernelOptions {
+  workgroupSize?: number;
+  /** Workgroup size for the quantized kernels. */
+  quantWorkgroupSize?: number;
+  /** Output rows each quantized-matvec workgroup covers. Swept at M5. */
+  rowsPerWorkgroup?: number;
+}
+
 export async function createKernels(
   cache: PipelineCache,
-  workgroupSize: number = DEFAULT_WORKGROUP,
+  options: KernelOptions = {},
 ): Promise<KernelSet> {
+  const workgroupSize = options.workgroupSize ?? DEFAULT_WORKGROUP;
+  const rowsPerWorkgroup = options.rowsPerWorkgroup ?? DEFAULT_ROWS_PER_WORKGROUP;
+  const quantWorkgroup = options.quantWorkgroupSize ?? DEFAULT_QUANT_WORKGROUP;
   const constants = { wg_size: workgroupSize };
   const build = (code: string, label: string): Promise<GPUComputePipeline> =>
     cache.compute({ code, label: `${label}(wg=${workgroupSize})`, constants });
@@ -243,9 +285,15 @@ export async function createKernels(
     reduceSumExp,
     topkPartial,
     topkSelect,
+    matvecQ4,
+    swigluQ4,
+    embedGatherQ4,
+    ...variantPipelines
   ] = await Promise.all([
     build(embedGatherSource, 'embed_gather'),
-    build(rmsNormSource, 'rmsnorm'),
+    // rmsnorm pins its own workgroup size (its shared array must be sized at compile
+    // time), so it takes no override.
+    cache.compute({ code: rmsNormSource, label: 'rmsnorm' }),
     build(matmulF16Source, 'matmul_f16'),
     build(matmulF16TiledSource, 'matmul_f16_tiled'),
     build(ropeSource, 'rope'),
@@ -261,7 +309,30 @@ export async function createKernels(
     cache.compute({ code: reduceSumExpSource, label: 'reduce_sumexp' }),
     cache.compute({ code: topkPartialSource, label: 'topk_partial' }),
     cache.compute({ code: topkSelectSource, label: 'topk_select' }),
+    cache.compute({
+      code: matvecQ4Source,
+      label: `matvec_q4(wg=${quantWorkgroup},rows=${rowsPerWorkgroup})`,
+      constants: { wg_size: quantWorkgroup, rows_per_wg: rowsPerWorkgroup },
+    }),
+    cache.compute({
+      code: swigluQ4Source,
+      label: `swiglu_q4(wg=${quantWorkgroup},rows=${rowsPerWorkgroup})`,
+      constants: { wg_size: quantWorkgroup, rows_per_wg: rowsPerWorkgroup },
+    }),
+    build(embedGatherQ4Source, 'embed_gather_q4'),
+    ...ROWS_PER_WORKGROUP_VARIANTS.map((rows) =>
+      cache.compute({
+        code: matvecQ4Source,
+        label: `matvec_q4(wg=${quantWorkgroup},rows=${rows})`,
+        constants: { wg_size: quantWorkgroup, rows_per_wg: rows },
+      }),
+    ),
   ]);
+
+  const matvecQ4Variants = new Map<number, GPUComputePipeline>();
+  ROWS_PER_WORKGROUP_VARIANTS.forEach((rows, index) => {
+    matvecQ4Variants.set(rows, variantPipelines[index]);
+  });
 
   return {
     embedGather,
@@ -279,7 +350,12 @@ export async function createKernels(
     reduceSumExp,
     topkPartial,
     topkSelect,
+    matvecQ4,
+    matvecQ4Variants,
+    swigluQ4,
+    embedGatherQ4,
     workgroupSize,
+    rowsPerWorkgroup,
   };
 }
 
@@ -320,6 +396,53 @@ export const MATMUL_TILE_T = 4;
 
 /** Partial groups used by the reduction and top-k kernels. */
 export const REDUCE_GROUPS = 256;
+
+/**
+ * Workgroup shape for the quantized kernels, chosen by the sweep in
+ * tests/decode.bench.test.ts rather than guessed.
+ *
+ * What actually matters is lanes_per_row = wg / rows = 8: enough lanes to hide latency,
+ * few enough that the reduction tree stays shallow relative to the work each lane does.
+ * Every configuration with that ratio lands within a few percent of the best; the ones
+ * that stray from it fall off sharply (wg=128/rows=4 gives lanes_per_row=32 and loses 20%).
+ *
+ * rows must also be at least 4, or the 151,936-row lm_head exceeds
+ * maxComputeWorkgroupsPerDimension -- the sweep rediscovers blocker B2 on every run.
+ *
+ * Separate from DEFAULT_WORKGROUP because the general kernels -- notably the tiled fp16
+ * prefill matmul, whose shared-memory staging wants more lanes -- are not the same shape.
+ */
+export const DEFAULT_QUANT_WORKGROUP = 64;
+export const DEFAULT_ROWS_PER_WORKGROUP = 8;
+
+/** Rows-per-workgroup values compiled up front so a matmul can pick one at dispatch. */
+export const ROWS_PER_WORKGROUP_VARIANTS = [1, 2, 4, 8, 16, 32] as const;
+
+/**
+ * Workgroups we want in flight for a matmul. Below this the GPU is left partly idle; the
+ * value is a target, not a guarantee, because the dispatch limit and the row count both
+ * constrain what is reachable.
+ */
+const TARGET_WORKGROUPS = 512;
+
+/**
+ * Pick rows-per-workgroup for a matmul with `rows` outputs.
+ *
+ * Small matrices want few rows per workgroup so more workgroups launch and each row gets
+ * more lanes; large ones want the opposite, because `maxComputeWorkgroupsPerDimension` is
+ * 65,535 on every adapter and the 151,936-row lm_head does not fit below 4.
+ */
+export function pickRowsPerWorkgroup(rows: number, maxWorkgroups: number): number {
+  const candidates = [...ROWS_PER_WORKGROUP_VARIANTS];
+  const feasible = candidates.filter((r) => Math.ceil(rows / r) <= maxWorkgroups);
+  if (feasible.length === 0) return candidates[candidates.length - 1];
+  // Smallest value that still launches enough workgroups; falls back to the largest
+  // feasible one when the matrix simply is not big enough.
+  for (const rowsPerWg of feasible) {
+    if (Math.ceil(rows / rowsPerWg) >= TARGET_WORKGROUPS) return rowsPerWg;
+  }
+  return feasible[feasible.length - 1];
+}
 
 /** Largest k the sample-output block is sized for. */
 export const MAX_TOP_K = 64;

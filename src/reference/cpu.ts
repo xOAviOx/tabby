@@ -306,3 +306,88 @@ export function siluMul(gate: Float32Array, up: Float32Array): Float32Array {
   }
   return out;
 }
+
+// =======================================================================================
+// M5 quantized kernels
+// =======================================================================================
+
+export interface QuantSpec {
+  bits: 4 | 8;
+  blockSize: number;
+}
+
+/**
+ * Dequantize one block-quantized row. Mirrors `dequantize_blockwise` in convert.py and
+ * the in-register unpacking the WGSL kernels do.
+ */
+export function dequantizeRow(
+  words: Uint32Array,
+  scales: Float32Array,
+  cols: number,
+  spec: QuantSpec,
+  wordOffset = 0,
+  scaleOffset = 0,
+): Float32Array {
+  const perWord = spec.bits === 4 ? 8 : 4;
+  const shift = 32 / perWord;
+  const mask = (1 << shift) - 1;
+  const out = new Float32Array(cols);
+
+  for (let c = 0; c < cols; c++) {
+    const word = words[wordOffset + Math.floor(c / perWord)];
+    const raw = (word >>> ((c % perWord) * shift)) & mask;
+    const centred = spec.bits === 4 ? raw - 8 : raw > 127 ? raw - 256 : raw;
+    out[c] = f32(centred * scales[scaleOffset + Math.floor(c / spec.blockSize)]);
+  }
+  return out;
+}
+
+/**
+ * y[t, m] = sum_k dequant(w[m, k]) * x[t, k] + bias[m].
+ *
+ * Accumulation follows the GPU kernel: the block scale is factored out of the inner sum
+ * rather than multiplied into every weight, because doing it the other way changes the
+ * rounding and would make an exact comparison impossible.
+ */
+export function matmulQuantized(
+  words: Uint32Array,
+  scales: Float32Array,
+  x: Float32Array,
+  nTokens: number,
+  outDim: number,
+  inDim: number,
+  spec: QuantSpec,
+  bias: Float32Array | null,
+): Float32Array {
+  const perWord = spec.bits === 4 ? 8 : 4;
+  const shift = 32 / perWord;
+  const mask = (1 << shift) - 1;
+  const wordsPerRow = inDim / perWord;
+  const wordsPerBlock = spec.blockSize / perWord;
+  const blocksPerRow = inDim / spec.blockSize;
+
+  const y = new Float32Array(nTokens * outDim);
+  for (let t = 0; t < nTokens; t++) {
+    const xBase = t * inDim;
+    for (let m = 0; m < outDim; m++) {
+      const wBase = m * wordsPerRow;
+      const sBase = m * blocksPerRow;
+      let acc = 0;
+      for (let w = 0; w < wordsPerRow; w++) {
+        const word = words[wBase + w];
+        const scale = scales[sBase + Math.floor(w / wordsPerBlock)];
+        const k0 = w * perWord;
+        let blockSum = 0;
+        for (let lane = 0; lane < perWord; lane++) {
+          const raw = (word >>> (lane * shift)) & mask;
+          const centred = spec.bits === 4 ? raw - 8 : raw > 127 ? raw - 256 : raw;
+          blockSum = f32(blockSum + f32(centred * x[xBase + k0 + lane]));
+        }
+        acc = f32(acc + f32(blockSum * scale));
+      }
+      if (bias) acc = f32(acc + bias[m]);
+      y[t * outDim + m] = acc;
+    }
+  }
+  return y;
+}

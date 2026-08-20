@@ -23,15 +23,23 @@ import {
   type ProgressCallback,
 } from './store.js';
 
-export type TensorDType = 'f16' | 'f32';
+export type TensorDType = 'f16' | 'f32' | 'q4' | 'q8';
 
-const ELEMENT_BYTES: Record<TensorDType, number> = { f16: 2, f32: 4 };
+/**
+ * Bytes a single element occupies. Quantized dtypes are fractional -- int4 packs two
+ * weights per byte -- so row sizes are computed as `cols * ELEMENT_BYTES[dtype]`, which
+ * stays exact for every dimension a block-quantized tensor can have (block sizes are
+ * powers of two, so a row is always a whole number of bytes).
+ */
+const ELEMENT_BYTES: Record<TensorDType, number> = { f16: 2, f32: 4, q4: 0.5, q8: 1 };
 
-/** Populated at M5. Declared now so the header schema does not change under us. */
 export interface QuantMeta {
   scheme: string;
   bits: number;
+  /** Weights per scale, along the reduction dimension. */
   blockSize: number;
+  /** Name of the f16 tensor holding one scale per block. */
+  scales: string;
 }
 
 export interface TensorMeta {
@@ -155,7 +163,7 @@ export function parseHeader(raw: unknown): WeightHeader {
   }
 
   const tensors = (obj.tensors as TensorMeta[]).map((t) => {
-    if (t.dtype !== 'f16' && t.dtype !== 'f32') {
+    if (!(t.dtype in ELEMENT_BYTES)) {
       throw new ModelLoadError(`tensor ${t.name}: unsupported dtype ${t.dtype}`);
     }
     return t;
@@ -195,6 +203,12 @@ export interface GpuTensor {
   byteLength: number;
   shards: TensorShard[];
   quant: QuantMeta | null;
+  /** For a quantized tensor, the f16 block scales. Resolved after all tensors load. */
+  scales: GpuTensor | null;
+}
+
+export function isQuantized(tensor: GpuTensor): boolean {
+  return tensor.quant !== null;
 }
 
 export function tensorGeometry(meta: TensorMeta): {
@@ -287,6 +301,32 @@ export class WeightRegistry {
     let most = 1;
     for (const tensor of this.tensors.values()) most = Math.max(most, tensor.shards.length);
     return most;
+  }
+
+  /**
+   * Attach each quantized tensor's block scales.
+   *
+   * A quantized tensor and its scales must shard identically for a kernel to pair them,
+   * and nothing here enforces that, so quantized tensors are required to be single-shard.
+   * That is not a limitation in practice: int4 shrinks the largest tensor -- the 260 MiB
+   * embedding -- to 68 MiB, comfortably inside the 128 MiB binding size every adapter
+   * guarantees. If it ever does need to shard, both must be planned together.
+   */
+  linkQuantScales(): void {
+    for (const tensor of this.tensors.values()) {
+      if (!tensor.quant) continue;
+      const scales = this.tensors.get(tensor.quant.scales);
+      if (!scales) {
+        throw new ModelLoadError(`${tensor.name}: missing scales tensor ${tensor.quant.scales}`);
+      }
+      if (tensor.shards.length !== 1 || scales.shards.length !== 1) {
+        throw new ModelLoadError(
+          `${tensor.name}: quantized tensors must be single-shard ` +
+            `(weights ${tensor.shards.length}, scales ${scales.shards.length})`,
+        );
+      }
+      tensor.scales = scales;
+    }
   }
 
   destroy(): void {
@@ -471,10 +511,13 @@ export async function loadModel(
         byteLength: meta.byteLength,
         shards,
         quant: meta.quant,
+        scales: null,
       });
       report('upload', meta.name, allCached);
     }
 
+    // Scales are ordinary tensors in the directory; link them once everything is present.
+    registry.linkQuantScales();
     await device.queue.onSubmittedWorkDone();
   } catch (err) {
     registry.destroy();
