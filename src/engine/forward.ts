@@ -22,17 +22,19 @@
 import { BufferArena, readBuffer, readF32 } from './buffers.js';
 import { withErrorScopes } from './device.js';
 import { KvCache, type KvCacheOptions } from './kvcache.js';
+import { Profiler, Recorder } from './profiler.js';
 import {
   MATMUL_TILE_T,
   MAX_TOP_K,
   REDUCE_GROUPS,
   createKernels,
-  dispatch,
   groupsFor,
+  pickRowsPerWorkgroup,
   uniforms,
   type KernelSet,
 } from './kernels.js';
 import { bindGroup, type PipelineCache } from './pipelines.js';
+import { isQuantized } from './model.js';
 import type { GpuTensor, LoadedModel, ModelConfig, WeightRegistry } from './model.js';
 
 /** Narrow a result to its logits, failing loudly if the run sampled on the GPU instead. */
@@ -55,6 +57,20 @@ export class ForwardError extends Error {
 export interface ForwardPassOptions {
   /** Context length. Sizes the KV cache and every scratch buffer. */
   maxSeqLen?: number;
+  /** Workgroup size for the general kernels. */
+  workgroupSize?: number;
+  /** Workgroup size for the quantized kernels. Swept at M5. */
+  quantWorkgroupSize?: number;
+  /** Output rows per quantized-matvec workgroup. Swept at M5. */
+  rowsPerWorkgroup?: number;
+  /** Fuse gate_proj + up_proj + silu into one dispatch. Kept switchable to be measured. */
+  fuseSwiglu?: boolean;
+  /**
+   * Choose rows-per-workgroup per matmul instead of one value everywhere. Measured at
+   * 72 tok/s against 101 for the fixed value, so it is off by default; kept because the
+   * negative result is worth being able to reproduce.
+   */
+  adaptiveRows?: boolean;
   /**
    * Use the tiled matmul for multi-position prefill. Default true. Exposed so the tiling
    * can be measured against the naive kernel rather than assumed to help, and so M5 can
@@ -141,6 +157,9 @@ export class ForwardPass {
   private readonly arena: BufferArena;
   private readonly maxSeqLen: number;
   private readonly tiledPrefill: boolean;
+  private readonly fuseSwiglu: boolean;
+  private readonly adaptiveRows: boolean;
+  private profiler: Profiler | null = null;
   readonly cache: KvCache;
 
   private readonly ids: GPUBuffer;
@@ -167,7 +186,11 @@ export class ForwardPass {
     device: GPUDevice,
     model: LoadedModel,
     kernels: KernelSet,
-    options: KvCacheOptions & { tiledPrefill: boolean },
+    options: KvCacheOptions & {
+      tiledPrefill: boolean;
+      fuseSwiglu: boolean;
+      adaptiveRows: boolean;
+    },
   ) {
     this.device = device;
     this.config = model.config;
@@ -175,6 +198,8 @@ export class ForwardPass {
     this.kernels = kernels;
     this.maxSeqLen = options.maxSeqLen;
     this.tiledPrefill = options.tiledPrefill;
+    this.fuseSwiglu = options.fuseSwiglu;
+    this.adaptiveRows = options.adaptiveRows;
     this.arena = new BufferArena(device);
     this.cache = new KvCache(device, model.config, options);
 
@@ -219,15 +244,47 @@ export class ForwardPass {
     cache: PipelineCache,
     options: ForwardPassOptions = {},
   ): Promise<ForwardPass> {
-    const kernels = await createKernels(cache);
+    const kernels = await createKernels(cache, {
+      ...(options.workgroupSize === undefined ? {} : { workgroupSize: options.workgroupSize }),
+      ...(options.quantWorkgroupSize === undefined
+        ? {}
+        : { quantWorkgroupSize: options.quantWorkgroupSize }),
+      ...(options.rowsPerWorkgroup === undefined
+        ? {}
+        : { rowsPerWorkgroup: options.rowsPerWorkgroup }),
+    });
     return new ForwardPass(device, model, kernels, {
       maxSeqLen: options.maxSeqLen ?? DEFAULT_MAX_SEQ_LEN,
       tiledPrefill: options.tiledPrefill ?? true,
+      fuseSwiglu: options.fuseSwiglu ?? true,
+      adaptiveRows: options.adaptiveRows ?? false,
     });
   }
 
   get maxSequenceLength(): number {
     return this.maxSeqLen;
+  }
+
+  /**
+   * Turn per-kernel timing on. Profiling gives every dispatch its own compute pass so it
+   * can carry a timestamp pair, which is measurably slower than the single-pass encoding
+   * used normally -- so the numbers it reports are shares, not absolute throughput.
+   */
+  enableProfiling(enabled: boolean): boolean {
+    if (!enabled) {
+      this.profiler?.destroy();
+      this.profiler = null;
+      return false;
+    }
+    if (!Profiler.supported(this.device)) return false;
+    this.profiler ??= new Profiler(this.device, true);
+    return true;
+  }
+
+  /** Timings from the most recent run. Empty unless profiling is on. */
+  async profile(): Promise<import('./profiler.js').ProfileReport> {
+    if (!this.profiler) return { kernels: [], totalMs: 0, passCount: 0 };
+    return this.profiler.collect();
   }
 
   /** Tokens currently in the KV cache. */
@@ -240,6 +297,7 @@ export class ForwardPass {
   }
 
   destroy(): void {
+    this.profiler?.destroy();
     this.cache.destroy();
     this.arena.destroy();
   }
@@ -304,26 +362,27 @@ export class ForwardPass {
         const hiddenBytes = nNew * c.hiddenSize * 4;
         const slotBytes = this.maxSeqLen * c.hiddenSize * 4;
 
-        // A copy cannot be recorded inside a compute pass, so each capture closes the
-        // pass and opens a new one. It is still one command buffer and one submit.
-        let pass = encoder.beginComputePass({ label: 'forward' });
+        this.profiler?.reset();
+        const rec = new Recorder(encoder, this.device.limits, this.profiler);
+
+        // A copy cannot be recorded inside a compute pass, so a capture interrupts the
+        // recorder; it reopens lazily on the next dispatch. Still one command buffer.
         const captureInto = (slot: number, source: GPUBuffer): void => {
           if (!capture) return;
-          pass.end();
+          rec.interrupt();
           encoder.copyBufferToBuffer(source, 0, this.capture, slot * slotBytes, hiddenBytes);
-          pass = encoder.beginComputePass({ label: 'forward' });
         };
 
-        this.encodeEmbedding(pass, uniform, nNew);
+        this.encodeEmbedding(rec, uniform, nNew);
         captureInto(0, this.x);
 
         for (let layer = 0; layer < c.numHiddenLayers; layer++) {
-          this.encodeLayer(pass, uniform, segment, layer);
+          this.encodeLayer(rec, uniform, segment, layer);
           captureInto(layer + 1, this.x);
         }
 
         this.encodeRmsNorm(
-          pass,
+          rec,
           uniform,
           nNew,
           this.x,
@@ -335,7 +394,7 @@ export class ForwardPass {
 
         // Only the last position needs logits, and at 152k vocab that is the difference
         // between one matmul row-block and nNew of them.
-        pass.end();
+        rec.interrupt();
         encoder.copyBufferToBuffer(
           this.xNorm,
           (nNew - 1) * c.hiddenSize * 4,
@@ -343,9 +402,8 @@ export class ForwardPass {
           0,
           c.hiddenSize * 4,
         );
-        const headPass = encoder.beginComputePass({ label: 'lm_head' });
         this.encodeMatmul(
-          headPass,
+          rec,
           uniform,
           1,
           this.tensor('lm_head.weight'),
@@ -355,10 +413,11 @@ export class ForwardPass {
           c.vocabSize,
           'lm_head',
         );
-        headPass.end();
 
-        if (topK > 0) this.encodeSampling(encoder, uniform, topK);
+        if (topK > 0) this.encodeSampling(encoder, rec, uniform, topK);
 
+        rec.finish();
+        this.profiler?.resolve(encoder);
         this.device.queue.submit([encoder.finish()]);
       });
 
@@ -417,6 +476,7 @@ export class ForwardPass {
    */
   private encodeSampling(
     encoder: GPUCommandEncoder,
+    rec: Recorder,
     uniform: UniformFn,
     topK: number,
   ): void {
@@ -424,8 +484,8 @@ export class ForwardPass {
     const vocab = c.vocabSize;
 
     // Mask the copy, not the originals: the softmax denominator below needs them intact.
+    rec.interrupt();
     encoder.copyBufferToBuffer(this.logits, 0, this.logitsWork, 0, vocab * 4);
-    const pass = encoder.beginComputePass({ label: 'sample' });
 
     const reduce = (
       pipeline: GPUComputePipeline,
@@ -440,7 +500,7 @@ export class ForwardPass {
         [uniform(dims, `${label}.dims`), ...buffers],
         `${label}.bind`,
       );
-      dispatch(pass, pipeline, group, this.device.limits, [groups], label);
+      rec.dispatch(pipeline, group, [groups], label);
     };
 
     // max over the full vocabulary, in two stages.
@@ -483,24 +543,47 @@ export class ForwardPass {
         uniforms.topkPartial(vocab),
         [this.logitsWork, this.partialsValue, this.partialsIndex],
         REDUCE_GROUPS,
-        `topk.partial[${step}]`,
+        'topk.partial',
       );
       reduce(
         this.kernels.topkSelect,
         uniforms.topkSelect(REDUCE_GROUPS, step, SAMPLE_HEADER_FLOATS),
         [this.partialsValue, this.partialsIndex, this.sampleOut, this.logitsWork],
         1,
-        `topk.select[${step}]`,
+        'topk.select',
       );
     }
-
-    pass.end();
   }
 
-  private encodeEmbedding(pass: GPUComputePassEncoder, uniform: UniformFn, nNew: number): void {
+  private encodeEmbedding(rec: Recorder, uniform: UniformFn, nNew: number): void {
     const c = this.config;
     const table = this.tensor('model.embed_tokens.weight');
     const wg = this.kernels.workgroupSize;
+
+    if (isQuantized(table)) {
+      const quant = table.quant!;
+      const scales = table.scales!;
+      for (const shard of table.shards) {
+        const dims = uniform(
+          uniforms.embedGatherQuant(
+            nNew,
+            c.hiddenSize,
+            quant.blockSize,
+            shard.rowStart,
+            shard.rowCount,
+          ),
+          'embed.dims',
+        );
+        const group = bindGroup(
+          this.device,
+          this.kernels.embedGatherQ4,
+          [dims, shard.buffer, scales.shards[0].buffer, this.ids, this.x],
+          'embed.bind',
+        );
+        rec.dispatch(this.kernels.embedGatherQ4, group, [groupsFor(c.hiddenSize, wg), nNew], 'embed_gather_q4');
+      }
+      return;
+    }
 
     for (const shard of table.shards) {
       const dims = uniform(
@@ -513,19 +596,12 @@ export class ForwardPass {
         [dims, shard.buffer, this.ids, this.x],
         'embed.bind',
       );
-      dispatch(
-        pass,
-        this.kernels.embedGather,
-        group,
-        this.device.limits,
-        [groupsFor(c.hiddenSize, wg), nNew],
-        'embed_gather',
-      );
+      rec.dispatch(this.kernels.embedGather, group, [groupsFor(c.hiddenSize, wg), nNew], 'embed_gather');
     }
   }
 
   private encodeRmsNorm(
-    pass: GPUComputePassEncoder,
+    rec: Recorder,
     uniform: UniformFn,
     nNew: number,
     input: GPUBuffer,
@@ -544,18 +620,12 @@ export class ForwardPass {
       [dims, input, gain.shards[0].buffer, output],
       `${label}.bind`,
     );
-    dispatch(
-      pass,
-      this.kernels.rmsNorm,
-      group,
-      this.device.limits,
-      [groupsFor(nNew, this.kernels.workgroupSize)],
-      label,
-    );
+    // One workgroup per row; the kernel pins its own workgroup size.
+    rec.dispatch(this.kernels.rmsNorm, group, [nNew], label);
   }
 
   private encodeMatmul(
-    pass: GPUComputePassEncoder,
+    rec: Recorder,
     uniform: UniformFn,
     nNew: number,
     weight: GpuTensor,
@@ -571,6 +641,11 @@ export class ForwardPass {
       throw new ForwardError(`${label}: bias is sharded, which is not supported`);
     }
     const biasBuffer = bias ? bias.shards[0].buffer : this.noBias;
+
+    if (isQuantized(weight)) {
+      this.encodeQuantMatmul(rec, uniform, nNew, weight, biasBuffer, bias !== null, input, output, outStride, label);
+      return;
+    }
 
     // Prefill reuses each weight row across TILE_T positions; decode has only one
     // position, so the tiling would just add barriers.
@@ -589,19 +664,68 @@ export class ForwardPass {
         [dims, shard.buffer, input, biasBuffer, output],
         `${label}.bind`,
       );
-      dispatch(
-        pass,
-        pipeline,
-        group,
-        this.device.limits,
-        [groupsFor(shard.rowCount, wg), rows],
-        label,
+      rec.dispatch(pipeline, group, [groupsFor(shard.rowCount, wg), rows], label);
+    }
+  }
+
+  /**
+   * Quantized matmul. One workgroup covers `rowsPerWorkgroup` output rows and reduces
+   * across its lanes, which is the shape a bandwidth-bound decode wants: consecutive
+   * lanes read consecutive packed words, so the loads coalesce.
+   */
+  private encodeQuantMatmul(
+    rec: Recorder,
+    uniform: UniformFn,
+    nNew: number,
+    weight: GpuTensor,
+    biasBuffer: GPUBuffer,
+    hasBias: boolean,
+    input: GPUBuffer,
+    output: GPUBuffer,
+    outStride: number,
+    label: string,
+  ): void {
+    const quant = weight.quant!;
+    const scales = weight.scales;
+    if (!scales) throw new ForwardError(`${label}: quantized tensor has no scales`);
+    if (quant.bits !== 4) {
+      throw new ForwardError(`${label}: only int4 has a kernel so far, got int${quant.bits}`);
+    }
+
+    for (const shard of weight.shards) {
+      // Chosen per matmul: q/k/v/o and down_proj have ~900 output rows and would launch
+      // only ~112 workgroups at the default, leaving most of the GPU idle.
+      const rowsPerWg = this.adaptiveRows
+        ? pickRowsPerWorkgroup(
+            shard.rowCount,
+            this.device.limits.maxComputeWorkgroupsPerDimension,
+          )
+        : this.kernels.rowsPerWorkgroup;
+      const pipeline = this.kernels.matvecQ4Variants.get(rowsPerWg) ?? this.kernels.matvecQ4;
+      const dims = uniform(
+        uniforms.matvecQuant(
+          nNew,
+          shard.rowCount,
+          weight.cols,
+          quant.blockSize,
+          hasBias,
+          shard.rowStart,
+          outStride,
+        ),
+        `${label}.dims`,
       );
+      const group = bindGroup(
+        this.device,
+        pipeline,
+        [dims, shard.buffer, scales.shards[0].buffer, input, biasBuffer, output],
+        `${label}.bind`,
+      );
+      rec.dispatch(pipeline, group, [groupsFor(shard.rowCount, rowsPerWg), nNew], label);
     }
   }
 
   private encodeElementwise(
-    pass: GPUComputePassEncoder,
+    rec: Recorder,
     uniform: UniformFn,
     pipeline: GPUComputePipeline,
     n: number,
@@ -611,18 +735,11 @@ export class ForwardPass {
   ): void {
     const dims = uniform(uniforms.elementwise(n), `${label}.dims`);
     const group = bindGroup(this.device, pipeline, [dims, readOnly, readWrite], `${label}.bind`);
-    dispatch(
-      pass,
-      pipeline,
-      group,
-      this.device.limits,
-      [groupsFor(n, this.kernels.workgroupSize)],
-      label,
-    );
+    rec.dispatch(pipeline, group, [groupsFor(n, this.kernels.workgroupSize)], label);
   }
 
   private encodeKvWrite(
-    pass: GPUComputePassEncoder,
+    rec: Recorder,
     uniform: UniformFn,
     source: GPUBuffer,
     destination: GPUBuffer,
@@ -637,18 +754,11 @@ export class ForwardPass {
       [dims, source, destination],
       `${label}.bind`,
     );
-    dispatch(
-      pass,
-      this.kernels.kvWrite,
-      group,
-      this.device.limits,
-      [groupsFor(elements, this.kernels.workgroupSize)],
-      label,
-    );
+    rec.dispatch(this.kernels.kvWrite, group, [groupsFor(elements, this.kernels.workgroupSize)], label);
   }
 
   private encodeLayer(
-    pass: GPUComputePassEncoder,
+    rec: Recorder,
     uniform: UniformFn,
     segment: Segment,
     layer: number,
@@ -663,7 +773,7 @@ export class ForwardPass {
 
     // ---- attention block ----------------------------------------------------------
     this.encodeRmsNorm(
-      pass,
+      rec,
       uniform,
       nNew,
       this.x,
@@ -679,7 +789,7 @@ export class ForwardPass {
     ] as Array<[string, GPUBuffer, number]>) {
       const biasName = p + `self_attn.${name}.bias`;
       this.encodeMatmul(
-        pass,
+        rec,
         uniform,
         nNew,
         this.tensor(p + `self_attn.${name}.weight`),
@@ -708,20 +818,13 @@ export class ForwardPass {
         [dims, buffer],
         `L${layer}.rope_${label}.bind`,
       );
-      dispatch(
-        pass,
-        this.kernels.rope,
-        group,
-        this.device.limits,
-        [groupsFor((heads * c.headDim) / 2, wg), nNew],
-        `L${layer}.rope_${label}`,
-      );
+      rec.dispatch(this.kernels.rope, group, [groupsFor((heads * c.headDim) / 2, wg), nNew], `L${layer}.rope_${label}`);
     }
 
     // Append this segment's K and V before attending, so the new positions are visible
     // to their own queries.
     this.encodeKvWrite(
-      pass,
+      rec,
       uniform,
       this.k,
       this.cache.keys,
@@ -730,7 +833,7 @@ export class ForwardPass {
       `L${layer}.k_cache`,
     );
     this.encodeKvWrite(
-      pass,
+      rec,
       uniform,
       this.v,
       this.cache.values,
@@ -759,14 +862,7 @@ export class ForwardPass {
         [dims, this.q, this.cache.keys, this.scores],
         `L${layer}.scores.bind`,
       );
-      dispatch(
-        pass,
-        this.kernels.attnScores,
-        group,
-        this.device.limits,
-        [groupsFor(totalLen, wg), nNew, c.numAttentionHeads],
-        `L${layer}.attn_scores`,
-      );
+      rec.dispatch(this.kernels.attnScores, group, [groupsFor(totalLen, wg), nNew, c.numAttentionHeads], `L${layer}.attn_scores`);
     }
 
     {
@@ -781,14 +877,7 @@ export class ForwardPass {
         [dims, this.scores],
         `L${layer}.softmax.bind`,
       );
-      dispatch(
-        pass,
-        this.kernels.softmaxRows,
-        group,
-        this.device.limits,
-        [groupsFor(rows, wg)],
-        `L${layer}.softmax`,
-      );
+      rec.dispatch(this.kernels.softmaxRows, group, [groupsFor(rows, wg)], `L${layer}.softmax`);
     }
 
     {
@@ -810,18 +899,11 @@ export class ForwardPass {
         [dims, this.scores, this.cache.values, this.attnOut],
         `L${layer}.attnout.bind`,
       );
-      dispatch(
-        pass,
-        this.kernels.attnOutput,
-        group,
-        this.device.limits,
-        [groupsFor(qDim, wg), nNew],
-        `L${layer}.attn_output`,
-      );
+      rec.dispatch(this.kernels.attnOutput, group, [groupsFor(qDim, wg), nNew], `L${layer}.attn_output`);
     }
 
     this.encodeMatmul(
-      pass,
+      rec,
       uniform,
       nNew,
       this.tensor(p + 'self_attn.o_proj.weight'),
@@ -832,7 +914,7 @@ export class ForwardPass {
       `L${layer}.o_proj`,
     );
     this.encodeElementwise(
-      pass,
+      rec,
       uniform,
       this.kernels.residualAdd,
       nNew * c.hiddenSize,
@@ -843,7 +925,7 @@ export class ForwardPass {
 
     // ---- MLP block ----------------------------------------------------------------
     this.encodeRmsNorm(
-      pass,
+      rec,
       uniform,
       nNew,
       this.x,
@@ -851,39 +933,72 @@ export class ForwardPass {
       this.xNorm,
       `L${layer}.post_norm`,
     );
+    const gateWeight = this.tensor(p + 'mlp.gate_proj.weight');
+    const upWeight = this.tensor(p + 'mlp.up_proj.weight');
+
+    if (this.fuseSwiglu && isQuantized(gateWeight) && isQuantized(upWeight)) {
+      // Fused: both projections read the same activations and feed the same SiLU, so
+      // running them separately would move x twice and round-trip `up` through memory.
+      const dims = uniform(
+        uniforms.swigluQuant(nNew, c.intermediateSize, c.hiddenSize, gateWeight.quant!.blockSize),
+        `L${layer}.swiglu.dims`,
+      );
+      const group = bindGroup(
+        this.device,
+        this.kernels.swigluQ4,
+        [
+          dims,
+          gateWeight.shards[0].buffer,
+          gateWeight.scales!.shards[0].buffer,
+          upWeight.shards[0].buffer,
+          upWeight.scales!.shards[0].buffer,
+          this.xNorm,
+          this.gate,
+        ],
+        `L${layer}.swiglu.bind`,
+      );
+      rec.dispatch(
+        this.kernels.swigluQ4,
+        group,
+        [groupsFor(c.intermediateSize, this.kernels.rowsPerWorkgroup), nNew],
+        `L${layer}.swiglu`,
+      );
+    } else {
+      this.encodeMatmul(
+        rec,
+        uniform,
+        nNew,
+        gateWeight,
+        null,
+        this.xNorm,
+        this.gate,
+        c.intermediateSize,
+        `L${layer}.gate_proj`,
+      );
+      this.encodeMatmul(
+        rec,
+        uniform,
+        nNew,
+        upWeight,
+        null,
+        this.xNorm,
+        this.up,
+        c.intermediateSize,
+        `L${layer}.up_proj`,
+      );
+      this.encodeElementwise(
+        rec,
+        uniform,
+        this.kernels.siluMul,
+        nNew * c.intermediateSize,
+        this.up,
+        this.gate,
+        `L${layer}.silu_mul`,
+      );
+    }
+
     this.encodeMatmul(
-      pass,
-      uniform,
-      nNew,
-      this.tensor(p + 'mlp.gate_proj.weight'),
-      null,
-      this.xNorm,
-      this.gate,
-      c.intermediateSize,
-      `L${layer}.gate_proj`,
-    );
-    this.encodeMatmul(
-      pass,
-      uniform,
-      nNew,
-      this.tensor(p + 'mlp.up_proj.weight'),
-      null,
-      this.xNorm,
-      this.up,
-      c.intermediateSize,
-      `L${layer}.up_proj`,
-    );
-    this.encodeElementwise(
-      pass,
-      uniform,
-      this.kernels.siluMul,
-      nNew * c.intermediateSize,
-      this.up,
-      this.gate,
-      `L${layer}.silu_mul`,
-    );
-    this.encodeMatmul(
-      pass,
+      rec,
       uniform,
       nNew,
       this.tensor(p + 'mlp.down_proj.weight'),
@@ -894,7 +1009,7 @@ export class ForwardPass {
       `L${layer}.down_proj`,
     );
     this.encodeElementwise(
-      pass,
+      rec,
       uniform,
       this.kernels.residualAdd,
       nNew * c.hiddenSize,
