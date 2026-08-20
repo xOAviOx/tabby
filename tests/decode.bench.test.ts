@@ -142,6 +142,66 @@ describe('quantized decode: optimization A/B', () => {
   }, 3_600_000);
 });
 
+/**
+ * How much of the measured decode rate is the sampler's readback rather than the model?
+ *
+ * `decodeRate` above -- and therefore the M5 throughput gate -- calls `decode()` with no
+ * `topK`, which reads the entire logit vector back to the CPU every step. On this
+ * vocabulary that is ~608 KB per token and a full pipeline sync. The chat path never does
+ * this; M4 added GPU-side top-k precisely to avoid it. So the gate is timing the engine
+ * plus a readback the shipping path does not perform.
+ */
+describe('quantized decode: what the per-token readback costs', () => {
+  it('measures the top-k path against the full-logit readback', async () => {
+    if (!model || !tokenizer) return;
+    const ids = tokenizer.encode('The history of computing is a history of abstraction.');
+    const cache = new PipelineCache(ctx.device);
+    const weights = model.stats.vramBytes;
+    const pass = await ForwardPass.create(ctx.device, model, cache, { maxSeqLen: 128 });
+
+    async function rate(topK: number): Promise<{ rate: number; bytes: number; encodeMs: number }> {
+      pass.reset();
+      let next = argmax(requireLogits(await pass.prefill(ids)));
+      let bytes = 0;
+      let encodeTotal = 0;
+      const step = async (): Promise<void> => {
+        const out = await pass.decode(next, topK > 0 ? { topK } : {});
+        bytes = out.readbackBytes;
+        encodeTotal += out.encodeMs;
+        next = topK > 0 ? out.topK!.ids[0] : argmax(requireLogits(out));
+      };
+      for (let i = 0; i < 4; i++) await step();
+      encodeTotal = 0;
+      const started = performance.now();
+      for (let i = 0; i < STEPS; i++) await step();
+      return {
+        rate: (STEPS / (performance.now() - started)) * 1000,
+        bytes,
+        encodeMs: encodeTotal / STEPS,
+      };
+    }
+
+    try {
+      for (const [name, topK] of [
+        ['full logits (what the gate measures)', 0],
+        ['top-k (what the chat path does)', 8],
+      ] as Array<[string, number]>) {
+        const runs = [await rate(topK), await rate(topK), await rate(topK), await rate(topK), await rate(topK)];
+        const best = Math.max(...runs.map((r) => r.rate));
+        console.log(
+          `  ${name.padEnd(38)}: ${best.toFixed(1).padStart(6)} tok/s  ` +
+            `${((weights * best) / 1e9).toFixed(1).padStart(5)} GB/s  ` +
+            `${String(runs[0].bytes).padStart(7)} B/token  ` +
+            `encode ${runs[0].encodeMs.toFixed(2)} ms of ${(1000 / best).toFixed(2)} ms/token  ` +
+            `(runs ${runs.map((r) => r.rate.toFixed(1)).join(', ')})`,
+        );
+      }
+    } finally {
+      pass.destroy();
+    }
+  }, 3_600_000);
+});
+
 describe('quantized decode: where the time goes', () => {
   it('profiles one decode step per kernel', async () => {
     if (!model || !tokenizer) return;
