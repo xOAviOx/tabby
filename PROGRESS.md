@@ -1,14 +1,15 @@
 # PROGRESS
 
-## Current milestone: M6 — in progress. The second model (SmolLM2-360M-Instruct) is converted and passes the full golden suite. Remaining: capability-detection page, README, deployment, and the benchmark table, which needs machines I do not have. See "Open questions for Avi".
+## Current milestone: M6 — in progress. Second model running, README written. Remaining: capability-detection page, deployment, and benchmark rows for two more machines, which needs hardware I do not have. See "Open questions for Avi".
 
 M5 is **complete, all gates met** as of 2026-08-20. B3 is closed: decode is 143.2 tok/s, 5.73x the M3 baseline against a 4x gate.
 
 ## Device limits negotiated on Apple M-series (`apple` / `metal-3`), Chromium 151 headless
 
 Measured by `npm test` on 2026-08-19. Chromium reports no `device`/`description` string
-for Apple adapters, so the exact SoC is not visible to the page — recorded from the host
-as macOS 15 (Darwin 24.5.0), Apple Silicon.
+for Apple adapters, so the exact SoC is not visible to the page. Read from the host
+instead, for the README's benchmark table: **Apple M4, 16 GB, macOS 15.5 (24F74),
+Chromium 151.0.7922.34 headless**.
 
 | limit | granted | WebGPU default | note |
 |---|---|---|---|
@@ -476,6 +477,34 @@ margin, where Qwen sits at 2.51e-3 — roughly 8x closer. It is 32 layers of f16
 instead of 24, from bf16 originals, so more drift is expected; but this passes with little
 room, and a stricter tolerance or a longer prompt could tip it. The top-5 ids and all 20
 greedy tokens still match PyTorch exactly, so the drift is not changing any decision yet.
+
+#### README, 2026-08-21
+
+Written, with everything PROJECT.md asks for except two of the three benchmark machines:
+what this is and what it is not (one line crediting WebLLM/MLC), an architecture diagram,
+the optimization table including the reverted rows, and "what surprised me".
+
+`tests/readme.bench.test.ts` prints the table's Markdown rows directly, so measuring
+another machine is `npm run bench -- tests/readme.bench.test.ts` and a paste, rather than a
+research task. It measures every converted model it finds and skips the rest. Device and
+browser strings are filled in by hand, since the page cannot read them on Apple adapters.
+
+Measured here (97-token prompt, decode best of 5 x 48 steps):
+
+| model | quant | prefill tok/s | decode tok/s | TTFT | VRAM |
+|---|---|---|---|---|---|
+| Qwen2.5-0.5B | fp16 | 398 | 32.1 | 244 ms | 942 MiB |
+| Qwen2.5-0.5B | int4 | 513 | 125.0 | 189 ms | 265 MiB |
+| SmolLM2-360M | fp16 | 450 | 34.0 | 213 ms | 690 MiB |
+| SmolLM2-360M | int4 | 593 | 121.3 | 162 ms | 194 MiB |
+
+Note decode is 125.0 here against the gate's 143.2: the gate uses a 5-token prompt and this
+uses 97, and attention grows with context. Both are real and they answer different
+questions; the README says so rather than quoting only the flattering one.
+
+**The table is deliberately one machine short.** The gate wants three and there is one, so
+the README prints one row set and says plainly that estimating the others would defeat the
+point. That is open question 2, still unanswered.
 
 ## The M5 optimization log
 
