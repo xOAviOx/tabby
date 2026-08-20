@@ -27,7 +27,26 @@ import type { ChatMessage } from '../tokenizer/chat_template.js';
 
 // The int4 build: 265 MiB against 942 MiB for fp16, and ~3.4x the decode throughput.
 const MODEL_ID = 'qwen2.5-0.5b-instruct-q4';
-const MODEL_BASE = new URL(`/models/${MODEL_ID}/`, location.href).href;
+
+/**
+ * Where the weights are fetched from.
+ *
+ * Same-origin `/models/<id>/` in development, where Vite serves `public/`. In a deployed
+ * build the weights are not part of the bundle -- `vite build` sets `copyPublicDir: false`
+ * because a static host is the wrong place for 265 MiB per visitor -- so `VITE_MODEL_BASE`
+ * points at wherever they actually live. Any host works provided it sends CORS headers and
+ * honours Range requests, which the resume-on-failure path in store.ts depends on.
+ *
+ * MODEL_ID stays the OPFS cache key either way, so moving the weights does not orphan a
+ * copy someone has already downloaded.
+ */
+const MODEL_BASE = (() => {
+  const configured = import.meta.env.VITE_MODEL_BASE;
+  if (!configured) return new URL(`/models/${MODEL_ID}/`, location.href).href;
+  // A base without a trailing slash would make `new URL('model.json', base)` drop the
+  // last path segment, which fails as a 404 far from here.
+  return configured.endsWith('/') ? configured : `${configured}/`;
+})();
 const MAX_SEQ_LEN = 1024;
 
 const SELF_CHECK_SHAPES = [

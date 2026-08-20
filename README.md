@@ -193,6 +193,33 @@ default 32); omit it for fp16. Norms, biases and RoPE tables always stay fp16/fp
 Conversion and golden-dump commands for both models are in
 [PROGRESS.md](PROGRESS.md).
 
+## Deploying
+
+The app is 132 KB built; the weights are 265 MiB and deliberately not part of it
+(`copyPublicDir: false`). They are two different hosting problems, so they get two hosts.
+
+Vercel's static upload cap is 100 MB on Hobby and 1 GB on Pro, so the weights cannot ship
+in a Hobby deployment at all — and even where they fit, every cold visitor pulls the whole
+model, which turns 100 GB of monthly bandwidth into about 370 visitors. The Hub is built
+for exactly this traffic, sends CORS headers, and honours Range requests, which the
+resume-on-failure path depends on.
+
+```bash
+# 1. Weights -> Hugging Face
+hf auth login
+hf upload <user>/browser-llm-weights \
+    public/models/qwen2.5-0.5b-instruct-q4 qwen2.5-0.5b-instruct-q4
+
+# 2. App -> Vercel, pointed at them
+vercel --prod --build-env \
+    VITE_MODEL_BASE=https://huggingface.co/<user>/browser-llm-weights/resolve/main/qwen2.5-0.5b-instruct-q4/
+```
+
+`VITE_MODEL_BASE` is read at build time. Unset, the app falls back to same-origin
+`/models/<id>/`, which is what `npm run dev` serves — so development needs no configuration
+and the deployed build needs no code change. Any host works if it sends CORS headers and
+supports Range requests.
+
 ## Status
 
 M0–M5 are complete and gated. M6 is in progress: the second model runs, and what remains
