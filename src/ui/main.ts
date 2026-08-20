@@ -14,6 +14,7 @@ import {
   describeContext,
   requestGpuContext,
   WebGpuUnavailableError,
+  type WebGpuUnavailableReason,
   type GpuContext,
 } from '../engine/device.js';
 import { PipelineCache } from '../engine/pipelines.js';
@@ -84,20 +85,50 @@ function formatLimit(key: string, value: number): string {
     : value.toLocaleString();
 }
 
-function renderUnavailable(message: string, detail: string): void {
+const BROWSER_REQUIREMENT =
+  'WebGPU needs Chrome or Edge 113+, or Safari 18+. On Linux it may require enabling ' +
+  'the Vulkan backend. Firefox ships it in release from 141 on Windows only.';
+
+/**
+ * What to tell someone for each way this can fail. A blank page is the failure M6 is
+ * meant to rule out, but so is advice that points the wrong way: telling a Chrome 130
+ * user to upgrade their browser, when the real problem is that the page is on plain
+ * http://, wastes their time more thoroughly than saying nothing.
+ */
+const UNAVAILABLE_GUIDANCE: Record<WebGpuUnavailableReason, { heading: string; help: string }> = {
+  'insecure-context': {
+    heading: 'This page needs a secure context',
+    help:
+      'Browsers only expose WebGPU over https:// or on localhost. This page is on ' +
+      'neither, so the API is missing regardless of which browser you are using. ' +
+      'Reopen it over https:// or from http://localhost.',
+  },
+  'no-webgpu': {
+    heading: 'This browser does not support WebGPU',
+    help: BROWSER_REQUIREMENT,
+  },
+  'no-adapter': {
+    heading: 'No GPU adapter is available',
+    help:
+      'This browser supports WebGPU but would not hand out an adapter. That usually ' +
+      'means the GPU or driver is blocklisted, the browser is running without a GPU ' +
+      'stack, or hardware acceleration is switched off. Check chrome://gpu, and make ' +
+      'sure hardware acceleration is enabled in settings.',
+  },
+};
+
+function renderUnavailable(heading: string, detail: string, help: string): void {
   const status = el('status');
   status.classList.add('fail');
   status.replaceChildren();
-  const heading = document.createElement('h2');
-  heading.textContent = message;
+  const title = document.createElement('h2');
+  title.textContent = heading;
   const body = document.createElement('p');
   body.textContent = detail;
-  const help = document.createElement('p');
-  help.className = 'muted';
-  help.textContent =
-    'WebGPU needs Chrome or Edge 113+, or Safari 18+. On Linux it may require enabling ' +
-    'the Vulkan backend. Firefox ships it in release from 141 on Windows only.';
-  status.append(heading, body, help);
+  const hint = document.createElement('p');
+  hint.className = 'muted';
+  hint.textContent = help;
+  status.append(title, body, hint);
 }
 
 // ---------------------------------------------------------------------------------------
@@ -542,13 +573,24 @@ async function main(): Promise<void> {
   try {
     ctx = await requestGpuContext({
       onDeviceLost: (info) =>
-        renderUnavailable('GPU device lost', `${info.reason}: ${info.message}`),
+        renderUnavailable(
+          'GPU device lost',
+          `${info.reason}: ${info.message}`,
+          'The GPU dropped the device after it had already started, so this is not a ' +
+            'browser support problem. Reload the page; if it keeps happening, another ' +
+            'process may be exhausting GPU memory.',
+        ),
     });
   } catch (error) {
     if (error instanceof WebGpuUnavailableError) {
-      renderUnavailable('WebGPU is not available in this browser', error.message);
+      const guidance = UNAVAILABLE_GUIDANCE[error.reason];
+      renderUnavailable(guidance.heading, error.message, guidance.help);
     } else {
-      renderUnavailable('Could not initialise WebGPU', String(error));
+      renderUnavailable(
+        'Could not initialise WebGPU',
+        String(error),
+        `This failed after WebGPU itself was reachable, so it is not a support problem. ${BROWSER_REQUIREMENT}`,
+      );
     }
     return;
   }

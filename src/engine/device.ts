@@ -52,10 +52,26 @@ export interface GpuContext {
   readonly limitsWereRefused: boolean;
 }
 
+/**
+ * Why WebGPU could not be reached. These look alike from the page and have completely
+ * different fixes, so the cause is carried as a value rather than left in prose:
+ *
+ *  - `insecure-context`: served over http:// somewhere other than localhost, or from
+ *    about:blank. `navigator.gpu` is simply absent, which is indistinguishable from an
+ *    old browser unless the context is checked.
+ *  - `no-webgpu`: secure context, but the browser does not implement WebGPU.
+ *  - `no-adapter`: the browser implements it and refused to give us one -- a blocklisted
+ *    driver, a headless build with no GPU stack, or a machine with nothing suitable.
+ */
+export type WebGpuUnavailableReason = 'insecure-context' | 'no-webgpu' | 'no-adapter';
+
 export class WebGpuUnavailableError extends Error {
-  constructor(message: string) {
+  readonly reason: WebGpuUnavailableReason;
+
+  constructor(message: string, reason: WebGpuUnavailableReason) {
     super(message);
     this.name = 'WebGpuUnavailableError';
+    this.reason = reason;
   }
 }
 
@@ -100,8 +116,18 @@ function buildRequiredLimits(adapter: GPUAdapter): Record<string, number> {
 
 export async function requestGpuContext(options: RequestDeviceOptions = {}): Promise<GpuContext> {
   if (typeof navigator === 'undefined' || !navigator.gpu) {
+    // A secure context is a precondition, not a detail: without one the API is not
+    // exposed at all, and telling someone to upgrade a browser that is already new
+    // enough sends them the wrong way entirely.
+    if (typeof isSecureContext !== 'undefined' && !isSecureContext) {
+      throw new WebGpuUnavailableError(
+        'This page is not a secure context, so WebGPU is not exposed to it at all.',
+        'insecure-context',
+      );
+    }
     throw new WebGpuUnavailableError(
       'navigator.gpu is undefined: this browser does not expose WebGPU.',
+      'no-webgpu',
     );
   }
 
@@ -111,6 +137,7 @@ export async function requestGpuContext(options: RequestDeviceOptions = {}): Pro
   if (!adapter) {
     throw new WebGpuUnavailableError(
       'requestAdapter() returned null: WebGPU is exposed but no adapter is available.',
+      'no-adapter',
     );
   }
 
