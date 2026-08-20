@@ -98,3 +98,42 @@ export function randomF16(count: number, seed: number): F16Data {
   }
   return { words, values };
 }
+
+/**
+ * Exact f32 -> f16 narrowing with round-to-nearest-even, including subnormals.
+ *
+ * Written out rather than using `DataView.setFloat16`, which is ES2025 and not in the
+ * TypeScript lib this project targets. Tests need it to hand the CPU reference the same
+ * f16-rounded scales the GPU kernel reads, so any difference is kernel logic rather than
+ * a conversion mismatch.
+ */
+export function f32ToF16Bits(value: number): number {
+  const buffer = new DataView(new ArrayBuffer(4));
+  buffer.setFloat32(0, value, true);
+  const bits = buffer.getUint32(0, true);
+
+  const sign = (bits >>> 16) & 0x8000;
+  let exponent = (bits >>> 23) & 0xff;
+  let mantissa = bits & 0x7fffff;
+
+  if (exponent === 0xff) return sign | 0x7c00 | (mantissa ? 0x200 : 0);
+
+  let unbiased = exponent - 127 + 15;
+  if (unbiased >= 0x1f) return sign | 0x7c00; // overflows to infinity
+  if (unbiased <= 0) {
+    if (unbiased < -10) return sign; // underflows to zero
+    mantissa |= 0x800000;
+    const shift = 14 - unbiased;
+    let half = mantissa >>> shift;
+    const remainder = mantissa & ((1 << shift) - 1);
+    const halfway = 1 << (shift - 1);
+    if (remainder > halfway || (remainder === halfway && (half & 1) === 1)) half += 1;
+    return sign | half;
+  }
+
+  let half = (unbiased << 10) | (mantissa >>> 13);
+  const remainder = mantissa & 0x1fff;
+  if (remainder > 0x1000 || (remainder === 0x1000 && (half & 1) === 1)) half += 1;
+  // Rounding can carry into the exponent, which the bit pattern handles naturally.
+  return sign | half;
+}

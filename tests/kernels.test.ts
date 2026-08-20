@@ -324,7 +324,9 @@ describe('M2 kernels vs CPU reference', () => {
         { data: gain },
         { data: new Float32Array(nTokens * hidden), readBack: nTokens * hidden },
       ],
-      dispatch: [groupsFor(nTokens, WG)],
+      // One workgroup per row since M5: the kernel reduces across its own lanes and pins
+      // its workgroup size, so this is not groupsFor(nTokens, WG).
+      dispatch: [nTokens],
       label: 'rmsnorm',
     });
 
