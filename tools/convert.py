@@ -12,8 +12,9 @@ contiguous byte stream, and every tensor records its offset into *that stream*, 
 tensor larger than one chunk simply spans several -- which the 272 MB embedding matrix
 always will. The browser loader reassembles ranges across chunk boundaries.
 
-M1 emits fp16 matrices and fp32 norms/biases. Block-wise int4 arrives at M5; the
-tensor directory already carries the `quant` field it will populate.
+Rank-2 weights are quantized block-wise (int4 by default); rank-1 tensors -- RMSNorm
+gains and attention biases -- stay f32. They are a rounding error of the total size and
+quantizing them costs accuracy for nothing.
 
 Safetensors is parsed here directly rather than through the `safetensors` package.
 That is not gratuitous: the package's numpy API cannot return BF16 tensors at all
@@ -76,6 +77,9 @@ OPTIONAL_CONFIG_KEYS = [
     "sliding_window",
     "torch_dtype",
 ]
+
+# Quantization block, along the reduction (input) dimension. One scale per block.
+DEFAULT_BLOCK_SIZE = 32
 
 # safetensors dtype string -> (numpy dtype to read raw bytes as, element size)
 SAFETENSORS_DTYPES: dict[str, np.dtype] = {
@@ -245,6 +249,82 @@ class ChunkWriter:
 # --------------------------------------------------------------------------------------
 
 
+def quantize_blockwise(
+    values: np.ndarray,
+    bits: int,
+    block_size: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Symmetric block-wise quantization of a [rows, cols] matrix along `cols`.
+
+    Returns (packed u32 [rows, cols*bits/32], scales f16 [rows, cols/block_size]).
+
+    The int4 path follows llama.cpp's Q4_0: the scale is derived from the *signed* element
+    of largest magnitude so that element maps exactly onto the low end of the range, which
+    uses all 16 levels instead of wasting one. Dequantization is `(nibble - 8) * scale`.
+    """
+    rows, cols = values.shape
+    if cols % block_size != 0:
+        raise ConversionError(f"cols {cols} is not a multiple of block size {block_size}")
+
+    n_blocks = cols // block_size
+    blocks = np.ascontiguousarray(values, dtype=np.float32).reshape(rows, n_blocks, block_size)
+
+    if bits == 4:
+        # The signed value with the largest absolute magnitude in each block.
+        peak_index = np.argmax(np.abs(blocks), axis=2)
+        peak = np.take_along_axis(blocks, peak_index[..., None], axis=2)[..., 0]
+        scales = (peak / -8.0).astype(np.float32)
+        inverse = np.where(scales != 0.0, 1.0 / np.where(scales == 0.0, 1.0, scales), 0.0)
+        levels = np.clip(np.rint(blocks * inverse[..., None] + 8.0), 0, 15).astype(np.uint32)
+        per_word = 8
+    elif bits == 8:
+        amax = np.max(np.abs(blocks), axis=2)
+        scales = (amax / 127.0).astype(np.float32)
+        inverse = np.where(scales != 0.0, 1.0 / np.where(scales == 0.0, 1.0, scales), 0.0)
+        signed = np.clip(np.rint(blocks * inverse[..., None]), -128, 127).astype(np.int32)
+        levels = (signed & 0xFF).astype(np.uint32)
+        per_word = 4
+    else:
+        raise ConversionError(f"unsupported bit width {bits}; use 4 or 8")
+
+    flat = levels.reshape(rows, cols)
+    words = np.zeros((rows, cols // per_word), dtype=np.uint32)
+    grouped = flat.reshape(rows, cols // per_word, per_word)
+    shift = 32 // per_word
+    for lane in range(per_word):
+        words |= grouped[:, :, lane] << np.uint32(shift * lane)
+
+    return words, scales.astype(np.float16)
+
+
+def dequantize_blockwise(
+    words: np.ndarray,
+    scales: np.ndarray,
+    cols: int,
+    bits: int,
+    block_size: int,
+) -> np.ndarray:
+    """Inverse of quantize_blockwise, used to report the error the conversion introduced."""
+    rows = words.shape[0]
+    per_word = 8 if bits == 4 else 4
+    shift = 32 // per_word
+    mask = (1 << shift) - 1
+
+    lanes = []
+    for lane in range(per_word):
+        lanes.append((words >> np.uint32(shift * lane)) & np.uint32(mask))
+    flat = np.stack(lanes, axis=2).reshape(rows, cols).astype(np.int32)
+
+    if bits == 4:
+        centred = flat - 8
+    else:
+        centred = np.where(flat > 127, flat - 256, flat)
+
+    blocks = centred.reshape(rows, cols // block_size, block_size).astype(np.float32)
+    return (blocks * scales.astype(np.float32)[..., None]).reshape(rows, cols)
+
+
 def target_dtype(name: str, shape: tuple[int, ...], matrix_dtype: str) -> str:
     """
     Rank-2 weights carry essentially all the parameters and go to `matrix_dtype`.
@@ -361,6 +441,8 @@ def convert(
     out_dir: Path,
     chunk_bytes: int,
     matrix_dtype: str,
+    quant_bits: int = 0,
+    block_size: int = DEFAULT_BLOCK_SIZE,
 ) -> dict[str, Any]:
     started = time.time()
     config = build_config(model_dir)
@@ -382,20 +464,10 @@ def convert(
     total_source_params = 0
     total_overflow = 0
 
-    print(f"converting {len(names)} tensors from {model_dir}")
-    for name in names:
-        source = shards[name].read(name)
-        shape = tuple(int(d) for d in source.shape)
-        dtype = target_dtype(name, shape, matrix_dtype)
-        encoded = encode_tensor(source, dtype)
-        total_overflow += check_overflow(name, source, encoded)
-        total_source_params += int(np.prod(shape)) if shape else 1
-
+    def emit(name: str, payload: bytes, dtype: str, shape: tuple[int, ...], quant: Any) -> None:
         writer.align(TENSOR_ALIGNMENT)
         offset = writer.offset
-        payload = encoded.tobytes()
         writer.write(payload)
-
         directory.append(
             {
                 "name": name,
@@ -403,14 +475,64 @@ def convert(
                 "shape": list(shape),
                 "offset": offset,
                 "byteLength": len(payload),
-                # Populated at M5. Present now so the header schema does not change.
-                "quant": None,
+                "quant": quant,
                 # Convenience for the loader's range planning; `offset` remains
                 # authoritative because a tensor may span several chunks.
                 "firstChunk": offset // chunk_bytes,
-                "lastChunk": (offset + len(payload) - 1) // chunk_bytes if payload else offset // chunk_bytes,
+                "lastChunk": (offset + len(payload) - 1) // chunk_bytes
+                if payload
+                else offset // chunk_bytes,
             }
         )
+
+    quantized_count = 0
+    worst_quant_error = 0.0
+    print(f"converting {len(names)} tensors from {model_dir}")
+    for name in names:
+        source = shards[name].read(name)
+        shape = tuple(int(d) for d in source.shape)
+        total_source_params += int(np.prod(shape)) if shape else 1
+
+        # Only rank-2 weights are quantized, and only when the reduction dimension divides
+        # evenly into blocks. A tensor that does not qualify falls back to f16 with a note
+        # rather than being silently padded into a different shape.
+        quantizable = quant_bits > 0 and len(shape) == 2 and shape[1] % block_size == 0
+        if quant_bits > 0 and len(shape) == 2 and not quantizable:
+            print(f"  note: {name} cols {shape[1]} not divisible by {block_size}; keeping f16")
+
+        if quantizable:
+            words, scales = quantize_blockwise(source, quant_bits, block_size)
+            restored = dequantize_blockwise(words, scales, shape[1], quant_bits, block_size)
+            denominator = float(np.abs(source).max()) or 1.0
+            error = float(np.abs(restored - source).max()) / denominator
+            worst_quant_error = max(worst_quant_error, error)
+            quantized_count += 1
+
+            emit(
+                name,
+                np.ascontiguousarray(words, dtype="<u4").tobytes(),
+                f"q{quant_bits}",
+                shape,
+                {
+                    "scheme": "symmetric",
+                    "bits": quant_bits,
+                    "blockSize": block_size,
+                    "scales": f"{name}.scales",
+                },
+            )
+            emit(
+                f"{name}.scales",
+                np.ascontiguousarray(scales, dtype="<f2").tobytes(),
+                "f16",
+                (shape[0], shape[1] // block_size),
+                None,
+            )
+            continue
+
+        dtype = target_dtype(name, shape, matrix_dtype)
+        encoded = encode_tensor(source, dtype)
+        total_overflow += check_overflow(name, source, encoded)
+        emit(name, encoded.tobytes(), dtype, shape, None)
 
     chunks = writer.close()
     total_bytes = sum(c["bytes"] for c in chunks)
@@ -424,6 +546,11 @@ def convert(
             "converterVersion": FORMAT_VERSION,
         },
         "config": config,
+        "quant": (
+            {"bits": quant_bits, "blockSize": block_size, "scheme": "symmetric"}
+            if quant_bits
+            else None
+        ),
         "chunkBytes": chunk_bytes,
         "totalBytes": total_bytes,
         "tensorAlignment": TENSOR_ALIGNMENT,
@@ -446,6 +573,11 @@ def convert(
     )
     if tied:
         print("  tie_word_embeddings: lm_head.weight aliased to model.embed_tokens.weight")
+    if quantized_count:
+        print(
+            f"  quantized {quantized_count} tensors to int{quant_bits} "
+            f"(block {block_size}); worst relative dequant error {worst_quant_error:.2%}"
+        )
     if total_overflow:
         print(f"  WARNING: {total_overflow} value(s) overflowed f16 range", file=sys.stderr)
     return header
@@ -481,12 +613,32 @@ def main(argv: list[str] | None = None) -> int:
         "--matrix-dtype",
         choices=["f16", "f32"],
         default="f16",
-        help="dtype for rank-2 weights (default f16)",
+        help="dtype for unquantized rank-2 weights (default f16)",
+    )
+    parser.add_argument(
+        "--quant",
+        type=int,
+        choices=[0, 4, 8],
+        default=0,
+        help="block-wise quantization bit width for rank-2 weights; 0 disables (default 0)",
+    )
+    parser.add_argument(
+        "--block-size",
+        type=int,
+        default=DEFAULT_BLOCK_SIZE,
+        help=f"quantization block size along the reduction dim (default {DEFAULT_BLOCK_SIZE})",
     )
     args = parser.parse_args(argv)
 
     try:
-        convert(args.model_dir, args.out, args.chunk_bytes, args.matrix_dtype)
+        convert(
+            args.model_dir,
+            args.out,
+            args.chunk_bytes,
+            args.matrix_dtype,
+            args.quant,
+            args.block_size,
+        )
     except ConversionError as err:
         print(f"error: {err}", file=sys.stderr)
         return 1
