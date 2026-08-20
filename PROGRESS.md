@@ -1,6 +1,8 @@
 # PROGRESS
 
-## Current milestone: M5 — **complete, all gates met** as of 2026-08-20. B3 is closed: decode is 143.2 tok/s, 5.73x the M3 baseline against a 4x gate. M6 is unblocked.
+## Current milestone: M6 — in progress. The second model (SmolLM2-360M-Instruct) is converted and passes the full golden suite. Remaining: capability-detection page, README, deployment, and the benchmark table, which needs machines I do not have. See "Open questions for Avi".
+
+M5 is **complete, all gates met** as of 2026-08-20. B3 is closed: decode is 143.2 tok/s, 5.73x the M3 baseline against a 4x gate.
 
 ## Device limits negotiated on Apple M-series (`apple` / `metal-3`), Chromium 151 headless
 
@@ -422,6 +424,59 @@ between "2" and "The" for *what is 2 + 2?* is 0.96 logits, and both are plausibl
 On the `plain` prompt the fp16 model's own ranks 2-5 are near-identical filler tokens, so
 int4 reshuffling them is not evidence of anything.
 
+### M6 — second model running, 2026-08-20
+
+**SmolLM2-360M-Instruct converted and passing the whole golden suite.** `npm test` -> 111
+passed (was 105). PROJECT.md asks for the second model to run with *zero engine code
+changes*, and says that if changes are needed it is a genericity bug to be fixed properly
+rather than worked around. One was needed. See below.
+
+`tests/golden.test.ts` is now parameterised over models instead of being duplicated,
+because that is the claim: identical test code, identical engine, two architectures. It is
+not a near-copy of Qwen:
+
+| | Qwen2.5-0.5B | SmolLM2-360M |
+|---|---|---|
+| hidden / layers | 896 / 24 | 960 / **32** |
+| attention heads / KV heads | 14 / 2 (7 per KV) | **15 / 5** (odd head count, 3 per KV) |
+| intermediate | 4864 | 2560 |
+| vocab | 151,936 | **49,152** |
+| rope_theta | 1,000,000 | 100,000 |
+| attention bias | present | **absent** |
+| tie_word_embeddings | true | true |
+
+The odd head count and the absent attention bias are the two that mattered: the bias path
+was already optional (`weights.has(biasName)`), and nothing assumed an even head count.
+Conversion needed no flags and no code: 290 tensors, 361.8M params, 203.7 MB at int4 in
+7 chunks, tied embeddings aliased as on Qwen.
+
+| check | Qwen | SmolLM2 |
+|---|---|---|
+| dimensions read from the header, not the code | pass | pass |
+| tokenizes golden prompts to reference ids | pass | pass |
+| per-layer hidden states vs PyTorch (gate 2e-2) | 2.51e-3 | **1.95e-2** |
+| top-5 next-token ids exact | pass | pass |
+| greedy 20 tokens identical to PyTorch | pass | pass |
+
+**The genericity bug: the pretokenizer was Qwen-shaped.** `bpe.ts` looked for a single
+`Split` node with a `Regex` pattern and threw on anything else. Qwen has exactly that.
+SmolLM2 instead has a `Sequence` of `Digits { individual_digits: true }` and
+`ByteLevel { use_regex: true }` — no explicit regex anywhere in the file, because
+`tokenizers` hardcodes the GPT-2 regex for `ByteLevel` and only writes it out when a model
+overrides it.
+
+The fix is a stage pipeline: a `Sequence` becomes several stages applied in order, each
+splitting every piece the previous one produced, which is what `tokenizers` does. Qwen's
+own path is untouched by construction — its `ByteLevel` sets `use_regex: false`, so it
+contributes no stage and its single Split still does all the work. Unsupported constructs
+still throw rather than approximate, as with the chat template.
+
+**Worth watching: SmolLM2's per-layer error is 1.95e-2 against a 2e-2 gate**, a 2.5%
+margin, where Qwen sits at 2.51e-3 — roughly 8x closer. It is 32 layers of f16 accumulation
+instead of 24, from bf16 originals, so more drift is expected; but this passes with little
+room, and a stricter tolerance or a longer prompt could tip it. The top-5 ids and all 20
+greedy tokens still match PyTorch exactly, so the drift is not changing any decision yet.
+
 ## The M5 optimization log
 
 Every row measured on this machine, int4 Qwen2.5-0.5B, decode only. **Two of the six
@@ -666,6 +721,18 @@ download. That is the M5 quantization case making itself, not a problem with M1.
   ```
   The tiny synthetic model *is* committed (~50 KB) so the fast loader tests always run:
   regenerate with `python3 tools/make_test_model.py`.
+- **The second model (M6) is regenerated the same way**, and `golden.test.ts` skips any
+  model whose files are absent, so a clone with neither still goes green:
+  ```
+  .venv/bin/hf download HuggingFaceTB/SmolLM2-360M-Instruct \
+      --local-dir models/SmolLM2-360M-Instruct \
+      config.json generation_config.json model.safetensors tokenizer.json tokenizer_config.json
+  python3 tools/convert.py models/SmolLM2-360M-Instruct --out public/models/smollm2-360m-instruct
+  python3 tools/convert.py models/SmolLM2-360M-Instruct --out public/models/smollm2-360m-instruct-q4 --quant 4
+  .venv/bin/python tools/golden.py models/SmolLM2-360M-Instruct --out public/golden/smollm2-360m-instruct
+  ```
+  SmolLM2 is ungated on HF; Llama-3.2-1B needs an accepted licence, which is why it was not
+  the second model. See open question 3.
 - **Goldens live in `public/golden/`** rather than `tests/golden/` so the dev server and
   test runner can fetch them over HTTP. 7.3 MB, gitignored, regenerate with:
   ```
