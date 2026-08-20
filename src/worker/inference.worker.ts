@@ -17,9 +17,11 @@ import { loadChatTemplate, type LoadedChatTemplate } from '../tokenizer/chat_tem
 import { SeededRandom, sampleFromTopK } from '../engine/sampler.js';
 import { MAX_TOP_K } from '../engine/kernels.js';
 import type { TopKResult } from '../engine/forward.js';
+import { Profiler } from '../engine/profiler.js';
 import type {
   GenerateRequest,
   LoadRequest,
+  ProfileRequest,
   WorkerRequest,
   WorkerResponse,
 } from './protocol.js';
@@ -98,6 +100,8 @@ async function handleLoad(request: LoadRequest): Promise<void> {
       bufferCount: model.stats.bufferCount,
       servedFromCache: model.stats.servedFromCache,
       pipelineMs,
+      weightBytes: model.stats.vramBytes,
+      canProfile: Profiler.supported(ctx.device),
     },
   });
 }
@@ -202,6 +206,46 @@ async function handleGenerate(request: GenerateRequest): Promise<void> {
   );
 }
 
+/**
+ * One decode step with per-kernel timestamps.
+ *
+ * Profiling gives every dispatch its own compute pass, which is slower than the
+ * single-pass encoding used normally -- so the shares are meaningful and the absolute
+ * total is not comparable to the throughput numbers.
+ */
+async function handleProfile(request: ProfileRequest): Promise<void> {
+  if (!forward || !tokenizer) throw new Error('profile received before the model loaded');
+  const { requestId } = request;
+
+  if (!forward.enableProfiling(true)) {
+    post({ type: 'profile', requestId, supported: false, kernels: [], totalMs: 0, passCount: 0 });
+    return;
+  }
+  try {
+    forward.reset();
+    const ids = tokenizer.encode(request.prompt || 'The history of computing is');
+    let next = argmaxOf(await forward.prefill(ids, { topK: 1 }));
+    for (let i = 0; i < 3; i++) next = argmaxOf(await forward.decode(next, { topK: 1 }));
+    await forward.decode(next, { topK: 1 });
+
+    const report = await forward.profile();
+    post({
+      type: 'profile',
+      requestId,
+      supported: true,
+      kernels: report.kernels,
+      totalMs: report.totalMs,
+      passCount: report.passCount,
+    });
+  } finally {
+    forward.enableProfiling(false);
+  }
+}
+
+function argmaxOf(result: { topK: TopKResult | null }): number {
+  return result.topK!.ids[0];
+}
+
 function finish(
   requestId: number,
   promptTokens: number,
@@ -244,6 +288,9 @@ scope.onmessage = (event: MessageEvent<WorkerRequest>) => {
       break;
     case 'generate':
       handleGenerate(request).catch((err) => fail(err, request.requestId));
+      break;
+    case 'profile':
+      handleProfile(request).catch((err) => fail(err, request.requestId));
       break;
     case 'cancel':
       // Recorded even if the request has not started yet, so a cancel that races the

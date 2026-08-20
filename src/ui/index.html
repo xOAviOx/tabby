@@ -15,8 +15,8 @@
       <header>
         <h1>Browser LLM</h1>
         <p class="sub">
-          Qwen2.5-0.5B-Instruct running entirely on your GPU via WebGPU, with hand-written
-          WGSL kernels. No server, no inference API.
+          Qwen2.5-0.5B-Instruct, int4 block-quantized, running entirely on your GPU via
+          WebGPU with hand-written WGSL kernels. No server, no inference API.
         </p>
       </header>
 
@@ -87,6 +87,16 @@
             settings always replay the same answer.
           </p>
         </details>
+      </section>
+
+      <section id="perf" class="card" hidden>
+        <div class="chat-head">
+          <h2>Performance</h2>
+          <button id="run-profile" type="button" class="secondary">Profile a decode step</button>
+        </div>
+        <dl id="perf-body" class="kv"></dl>
+        <table id="perf-kernels"></table>
+        <p id="perf-note" class="muted small"></p>
       </section>
 
       <details id="diagnostics" class="card" hidden>

@@ -24,7 +24,8 @@ import { InferenceClient, type LoadedInfo } from '../worker/client.js';
 import type { SamplingParams } from '../engine/sampler.js';
 import type { ChatMessage } from '../tokenizer/chat_template.js';
 
-const MODEL_ID = 'qwen2.5-0.5b-instruct';
+// The int4 build: 265 MiB against 942 MiB for fp16, and ~3.4x the decode throughput.
+const MODEL_ID = 'qwen2.5-0.5b-instruct-q4';
 const MODEL_BASE = new URL(`/models/${MODEL_ID}/`, location.href).href;
 const MAX_SEQ_LEN = 1024;
 
@@ -230,6 +231,13 @@ function setUpChat(client: InferenceClient, info: LoadedInfo): void {
         `${stats.readbackBytesPerToken} B/token readback` +
         (stats.cancelled ? ' · stopped' : '') +
         (stats.poolExhausted ? ' · top-p clipped by k' : '');
+      lastTurnStats = {
+        ttftMs: stats.ttftMs,
+        decodeTokPerSec: stats.decodeTokPerSec,
+        prefillTokPerSec: stats.prefillTokPerSec,
+        readbackBytesPerToken: stats.readbackBytesPerToken,
+      };
+      perfRefresh?.();
     } catch (error) {
       caret.remove();
       reply.remove();
@@ -329,6 +337,7 @@ async function setUpModelPanel(): Promise<void> {
       ]);
       details.hidden = false;
       setUpChat(client, info);
+      setUpPerfPanel(client, info);
     } catch (error) {
       status.textContent = '';
       label.textContent = '';
@@ -355,6 +364,95 @@ async function setUpModelPanel(): Promise<void> {
 
   await describeCache();
 }
+
+// ---------------------------------------------------------------------------------------
+// performance panel
+// ---------------------------------------------------------------------------------------
+
+/** Updated from each chat turn's stats so the panel reflects real generation, not a probe. */
+let lastTurnStats: {
+  ttftMs: number;
+  decodeTokPerSec: number;
+  prefillTokPerSec: number;
+  readbackBytesPerToken: number;
+} | null = null;
+
+function setUpPerfPanel(client: InferenceClient, info: LoadedInfo): void {
+  show('perf');
+  const body = el('perf-body');
+  const table = el<HTMLTableElement>('perf-kernels');
+  const note = el('perf-note');
+  const button = el<HTMLButtonElement>('run-profile');
+
+  const refresh = (): void => {
+    const rows: Array<[string, string]> = [
+      ['weights in VRAM', formatBytes(info.stats.weightBytes)],
+      ['KV cache', `${formatBytes(info.stats.kvCacheBytes)} for ${info.maxSeqLen} tokens`],
+    ];
+    if (lastTurnStats) {
+      const gbps = (info.stats.weightBytes * lastTurnStats.decodeTokPerSec) / 1e9;
+      rows.push(
+        ['decode', `${lastTurnStats.decodeTokPerSec.toFixed(1)} tok/s`],
+        ['prefill', `${lastTurnStats.prefillTokPerSec.toFixed(0)} tok/s`],
+        ['TTFT', `${lastTurnStats.ttftMs.toFixed(0)} ms`],
+        // Decode streams the whole weight set once per token, so this is the number that
+        // says whether the kernels are using the memory system well.
+        ['effective bandwidth', `${gbps.toFixed(1)} GB/s`],
+        ['readback', `${lastTurnStats.readbackBytesPerToken} B / token`],
+      );
+    } else {
+      rows.push(['decode', 'send a message to measure']);
+    }
+    defineList(body, rows);
+  };
+  refresh();
+  perfRefresh = refresh;
+
+  if (!info.stats.canProfile) {
+    button.disabled = true;
+    note.textContent = 'timestamp-query is unavailable on this adapter, so per-kernel timing is off.';
+    return;
+  }
+
+  button.addEventListener('click', async () => {
+    button.disabled = true;
+    note.textContent = 'profiling…';
+    try {
+      const report = await client.profile();
+      if (!report.supported) {
+        note.textContent = 'timestamp-query is unavailable on this adapter.';
+        return;
+      }
+      table.innerHTML =
+        '<thead><tr><th>kernel</th><th>calls</th><th>ms</th><th>share</th></tr></thead><tbody></tbody>';
+      const tbody = table.querySelector('tbody')!;
+      for (const kernel of report.kernels.slice(0, 12)) {
+        const row = document.createElement('tr');
+        for (const text of [
+          kernel.label,
+          String(kernel.calls),
+          kernel.totalMs.toFixed(3),
+          `${(kernel.fraction * 100).toFixed(1)}%`,
+        ]) {
+          const cell = document.createElement('td');
+          cell.textContent = text;
+          row.append(cell);
+        }
+        tbody.append(row);
+      }
+      note.textContent =
+        `${report.passCount} dispatches, ${report.totalMs.toFixed(2)} ms of GPU time. ` +
+        'Profiling gives every dispatch its own compute pass, which is slower than normal ' +
+        'encoding — the shares are meaningful, the absolute total is not.';
+    } catch (error) {
+      note.textContent = `profiling failed: ${String(error)}`;
+    } finally {
+      button.disabled = false;
+    }
+  });
+}
+
+let perfRefresh: (() => void) | null = null;
 
 // ---------------------------------------------------------------------------------------
 // diagnostics

@@ -32,12 +32,19 @@ export interface GenerateRequest {
   sampling: SamplingParams;
 }
 
+/** Run one profiled decode step and return the per-kernel breakdown. */
+export interface ProfileRequest {
+  type: 'profile';
+  requestId: number;
+  prompt: string;
+}
+
 export interface CancelRequest {
   type: 'cancel';
   requestId: number;
 }
 
-export type WorkerRequest = LoadRequest | GenerateRequest | CancelRequest;
+export type WorkerRequest = LoadRequest | GenerateRequest | ProfileRequest | CancelRequest;
 
 export interface ProgressResponse {
   type: 'progress';
@@ -60,6 +67,10 @@ export interface LoadStats {
   bufferCount: number;
   servedFromCache: boolean;
   pipelineMs: number;
+  /** Weight bytes resident on the GPU; the denominator for effective bandwidth. */
+  weightBytes: number;
+  /** True when timestamp-query is available, so the perf panel can offer profiling. */
+  canProfile: boolean;
 }
 
 export interface ReadyResponse {
@@ -106,6 +117,15 @@ export interface StatsResponse {
   stats: GenerationStats;
 }
 
+export interface ProfileResponse {
+  type: 'profile';
+  requestId: number;
+  supported: boolean;
+  kernels: Array<{ label: string; calls: number; totalMs: number; fraction: number }>;
+  totalMs: number;
+  passCount: number;
+}
+
 export interface ErrorResponse {
   type: 'error';
   requestId?: number;
@@ -118,4 +138,5 @@ export type WorkerResponse =
   | ReadyResponse
   | TokenResponse
   | StatsResponse
+  | ProfileResponse
   | ErrorResponse;

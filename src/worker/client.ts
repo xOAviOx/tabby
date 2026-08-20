@@ -41,6 +41,20 @@ export interface GenerateOptions {
   onToken?: (text: string, id: number, index: number) => void;
 }
 
+export interface KernelTiming {
+  label: string;
+  calls: number;
+  totalMs: number;
+  fraction: number;
+}
+
+export interface ProfileResult {
+  supported: boolean;
+  kernels: KernelTiming[];
+  totalMs: number;
+  passCount: number;
+}
+
 export interface GenerateHandle {
   /** Resolves when generation ends, whether by stop token, limit, or cancel. */
   done: Promise<GenerationStats>;
@@ -54,6 +68,8 @@ export class InferenceClient {
   private loadResolve: ((info: LoadedInfo) => void) | null = null;
   private loadReject: ((error: Error) => void) | null = null;
   private onProgress: ((progress: LoadProgress) => void) | null = null;
+
+  private profileResolve: ((result: ProfileResult) => void) | null = null;
 
   private active: {
     requestId: number;
@@ -119,6 +135,18 @@ export class InferenceClient {
         break;
       }
 
+      case 'profile': {
+        const resolve = this.profileResolve;
+        this.profileResolve = null;
+        resolve?.({
+          supported: message.supported,
+          kernels: message.kernels,
+          totalMs: message.totalMs,
+          passCount: message.passCount,
+        });
+        break;
+      }
+
       case 'error': {
         const error = new Error(message.message);
         error.name = message.name;
@@ -178,6 +206,15 @@ export class InferenceClient {
     });
 
     return { done, cancel: () => this.send({ type: 'cancel', requestId }) };
+  }
+
+  profile(prompt = 'The history of computing is'): Promise<ProfileResult> {
+    const requestId = this.nextRequestId++;
+    const promise = new Promise<ProfileResult>((resolve) => {
+      this.profileResolve = resolve;
+    });
+    this.send({ type: 'profile', requestId, prompt });
+    return promise;
   }
 
   terminate(): void {
