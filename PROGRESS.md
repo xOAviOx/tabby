@@ -1,6 +1,6 @@
 # PROGRESS
 
-## Current milestone: M6 — in progress. Second model running, README written. Remaining: capability-detection page, deployment, and benchmark rows for two more machines, which needs hardware I do not have. See "Open questions for Avi".
+## Current milestone: M6 — in progress. Second model running, README written, capability detection done. **Everything left needs Avi**: deployment (an account) and benchmark rows for two more machines (hardware). See "Open questions for Avi".
 
 M5 is **complete, all gates met** as of 2026-08-20. B3 is closed: decode is 143.2 tok/s, 5.73x the M3 baseline against a 4x gate.
 
@@ -505,6 +505,26 @@ questions; the README says so rather than quoting only the flattering one.
 **The table is deliberately one machine short.** The gate wants three and there is one, so
 the README prints one row set and says plainly that estimating the others would defeat the
 point. That is open question 2, still unanswered.
+
+#### Capability detection, 2026-08-21
+
+WebGPU can be missing three ways that look identical from the page and have completely
+different fixes, so `WebGpuUnavailableError` now carries a `reason` and the failure page
+switches on it:
+
+| reason | what it means | what the page says |
+|---|---|---|
+| `insecure-context` | http:// off localhost, or about:blank | reopen over https:// or localhost |
+| `no-webgpu` | secure context, browser lacks the API | the browser/version requirement |
+| `no-adapter` | API present, adapter refused | blocklisted driver, no GPU stack, acceleration off; check chrome://gpu |
+
+The insecure-context case was previously reported as "this browser does not support
+WebGPU", which is wrong and unactionable: `navigator.gpu` is absent there no matter how new
+the browser is. Device-lost also no longer prints browser-support advice, since by then
+WebGPU has demonstrably worked.
+
+`tests/capability.test.ts` stubs `navigator.gpu` to produce the absent cases on a machine
+that has WebGPU. 4 tests; the suite is 115.
 
 ## The M5 optimization log
 
