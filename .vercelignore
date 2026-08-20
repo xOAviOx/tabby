@@ -1,0 +1,14 @@
+# The weights are hosted on Hugging Face, not here: they are ~1.9 GB across all
+# conversions, and Vercel's static upload cap is 100 MB on Hobby. VITE_MODEL_BASE
+# points the built app at them. vite build already sets copyPublicDir: false, so
+# nothing under public/ reaches dist either way.
+public/models/
+public/golden/
+
+# Local-only
+models/
+.venv/
+node_modules/
+dist/
+tests/
+tools/
