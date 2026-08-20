@@ -110,6 +110,13 @@ export interface ForwardResult {
   activations: Float32Array[] | null;
   nTokens: number;
   ms: number;
+  /**
+   * Wall time spent on the CPU building this step's commands, up to and including
+   * `queue.submit`. Decode encodes ~400 dispatches per token and builds a uniform buffer
+   * and a bind group for each, so this is a real share of the step and is invisible in
+   * GPU timestamps. `ms - encodeMs` is roughly the wait on the GPU plus readback.
+   */
+  encodeMs: number;
   /** Bytes copied GPU -> CPU by this call. The M4 gate asserts on this. */
   readbackBytes: number;
 }
@@ -159,6 +166,9 @@ export class ForwardPass {
   private readonly tiledPrefill: boolean;
   private readonly fuseSwiglu: boolean;
   private readonly adaptiveRows: boolean;
+  /** Per-dispatch-site uniform buffers, reused across steps. See pooledUniform. */
+  private readonly uniformPool: GPUBuffer[] = [];
+  private uniformCursor = 0;
   private profiler: Profiler | null = null;
   readonly cache: KvCache;
 
@@ -300,6 +310,8 @@ export class ForwardPass {
     this.profiler?.destroy();
     this.cache.destroy();
     this.arena.destroy();
+    for (const buffer of this.uniformPool) buffer.destroy();
+    this.uniformPool.length = 0;
   }
 
   /** Process `ids` at the cache's current position, extending it. */
@@ -340,6 +352,7 @@ export class ForwardPass {
     const nNew = tokenIds.length;
     const segment: Segment = { nNew, posStart, totalLen: posStart + nNew };
     const started = performance.now();
+    let encodeMs = 0;
 
     const idArray = new Uint32Array(nNew);
     for (let i = 0; i < nNew; i++) {
@@ -353,8 +366,8 @@ export class ForwardPass {
 
     // Uniform buffers are allocated per call. Wasteful, but it keeps the dispatch code
     // readable and they are a few hundred bytes against ~1 GB of weights.
-    const perCall = new BufferArena(this.device);
-    const uniform: UniformFn = (data, label) => perCall.uniform(new Uint8Array(data), label);
+    this.uniformCursor = 0;
+    const uniform: UniformFn = (data, label) => this.pooledUniform(data, label);
 
     try {
       await withErrorScopes(this.device, `forward(${nNew}@${posStart})`, () => {
@@ -419,6 +432,7 @@ export class ForwardPass {
         rec.finish();
         this.profiler?.resolve(encoder);
         this.device.queue.submit([encoder.finish()]);
+        encodeMs = performance.now() - started;
       });
 
       let logits: Float32Array<ArrayBufferLike> | null = null;
@@ -455,11 +469,42 @@ export class ForwardPass {
         activations,
         nTokens: nNew,
         ms: performance.now() - started,
+        encodeMs,
         readbackBytes,
       };
     } finally {
-      perCall.destroy();
+      // Uniform buffers are pooled and outlive the call; see pooledUniform.
     }
+  }
+
+  /**
+   * A uniform buffer for one dispatch site, reused across steps.
+   *
+   * Decode encodes ~400 dispatches per token and each needs its own small uniform block.
+   * Allocating and destroying that many GPUBuffers every step was the largest single item
+   * of CPU encode time, and encode is serial with the GPU -- the device is idle while it
+   * happens. The dispatch sequence is deterministic for a given step shape, so site `i`
+   * takes pool slot `i` on every step and is refilled with `writeBuffer`, whose writes are
+   * ordered ahead of the submit that follows on the same queue.
+   *
+   * A slot is reallocated only when a step shape needs it larger than last time, which is
+   * why the size check is `<` rather than `!==`.
+   */
+  private pooledUniform(data: ArrayBuffer, label: string): GPUBuffer {
+    const size = Math.max(16, Math.ceil(data.byteLength / 16) * 16);
+    const index = this.uniformCursor++;
+    let buffer = this.uniformPool[index];
+    if (!buffer || buffer.size < size) {
+      buffer?.destroy();
+      buffer = this.device.createBuffer({
+        label: `uniform[${index}] ${label}`,
+        size,
+        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+      });
+      this.uniformPool[index] = buffer;
+    }
+    this.device.queue.writeBuffer(buffer, 0, data);
+    return buffer;
   }
 
   // -------------------------------------------------------------------------------------
