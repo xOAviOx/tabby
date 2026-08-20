@@ -1,6 +1,6 @@
 # PROGRESS
 
-## Current milestone: M5 — complete, but the throughput gate is **marginal**. See Blockers (B3).
+## Current milestone: M5 — everything built and gated **except decode throughput, which is not reliably met**. See B3. Do not start M6 until it is resolved.
 
 ## Device limits negotiated on Apple M-series (`apple` / `metal-3`), Chromium 151 headless
 
@@ -397,10 +397,12 @@ and asserting on it would have been testing the model rather than the engine. Th
 checks what is actually ours to guarantee: that changing the system message changes the
 output under greedy decoding. Exact template rendering is gated separately, against HF.
 
-### M5 — met, marginally, 2026-08-20
+### M5 — not met, 2026-08-20
 
-`npm test` -> 105 passed. The decode-throughput gate passes, but *only just*, and it does
-not pass on every run — see B3. Recorded honestly rather than as a clean tick.
+`npm test` -> 104 passed, **1 failed**. The failure is the decode-throughput gate, left
+failing on purpose: PROJECT.md forbids loosening a threshold to make a test pass, and it
+measures 97.7-100.6 tok/s against a 100 tok/s gate depending on the run. Everything else
+in M5 is done and gated.
 
 | gate | result |
 |---|---|
@@ -408,7 +410,7 @@ not pass on every run — see B3. Recorded honestly rather than as a clean tick.
 | quantized matvec dequantizing in-register | done — weights are never materialised as f16 |
 | quality vs PyTorch / fp16 | done — 92.5% top-1 agreement over 200 held-out steps |
 | perf panel with per-kernel breakdown | done — `profiler.ts` on timestamp queries |
-| **decode >= 4x the M3 baseline** | **100.6 tok/s vs 100 needed — 4.02x, but see B3** |
+| **decode >= 4x the M3 baseline** | **NOT MET — 97.7-100.6 tok/s against 100 needed. See B3** |
 
 **Size.** 942 MiB -> **265 MiB** (3.55x), 30 chunks -> 9.
 
@@ -532,15 +534,18 @@ The M5 rows are in their own table above, with the reverted changes included.
 
 ## Blockers
 
-**B3 — the M5 decode gate is met marginally and is not reliably reproducible.**
+**B3 — the M5 decode gate is NOT reliably met. This blocks M6.**
 
 The gate is "decode throughput at least 4x the M3 baseline". M3 recorded 23.98-26.56 tok/s
 and documented it as ~24-26; taking 25 as the baseline, the gate is 100 tok/s.
 
-Three runs of the gate test measured **97.7, 98.2 and 100.6 tok/s**. It passes on some runs
-and fails on others. Against the ends of the recorded M3 spread the ratio is **3.78x to
-4.19x**. I am flagging this rather than picking the run and the baseline that clear it:
-the honest statement is that decode is *about* 4x the M3 baseline, not comfortably past it.
+Four runs of the gate test measured **97.7, 98.2, 100.6 tok/s in isolation and a failure
+inside the full suite**, where the earlier test files leave the GPU warm and memory under
+pressure. Against the ends of the recorded M3 spread the ratio is **3.78x to 4.19x**.
+
+So: decode is *about* 4x the M3 baseline, and sometimes a little under. Calling that a pass
+would mean choosing the run and the baseline that clear it, so it is recorded as a miss.
+The remaining gap is roughly 3%.
 
 Against the *current* fp16 path the ratio is only 3.2x, because fp16 also benefits from the
 RMSNorm rewrite and the workgroup sweep — that comparison is stricter than the gate asks
