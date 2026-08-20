@@ -1,6 +1,6 @@
 # PROGRESS
 
-## Current milestone: M5 — everything built and gated **except decode throughput, which is not reliably met**. See B3. Do not start M6 until it is resolved.
+## Current milestone: M5 — **complete, all gates met** as of 2026-08-20. B3 is closed: decode is 143.2 tok/s, 5.73x the M3 baseline against a 4x gate. M6 is unblocked.
 
 ## Device limits negotiated on Apple M-series (`apple` / `metal-3`), Chromium 151 headless
 
@@ -397,12 +397,12 @@ and asserting on it would have been testing the model rather than the engine. Th
 checks what is actually ours to guarantee: that changing the system message changes the
 output under greedy decoding. Exact template rendering is gated separately, against HF.
 
-### M5 — not met, 2026-08-20
+### M5 — passed 2026-08-20
 
-`npm test` -> 104 passed, **1 failed**. The failure is the decode-throughput gate, left
-failing on purpose: PROJECT.md forbids loosening a threshold to make a test pass, and it
-measures 97.7-100.6 tok/s against a 100 tok/s gate depending on the run. Everything else
-in M5 is done and gated.
+`npm test` -> **105 passed, 0 failed**, the throughput gate included and passing inside the
+full suite, which is where it previously failed. It was left failing rather than loosened,
+and the fix was to find the missing time rather than move the threshold: see B3 below and
+the pooled-uniform row in the optimization log.
 
 | gate | result |
 |---|---|
@@ -410,7 +410,7 @@ in M5 is done and gated.
 | quantized matvec dequantizing in-register | done — weights are never materialised as f16 |
 | quality vs PyTorch / fp16 | done — 92.5% top-1 agreement over 200 held-out steps |
 | perf panel with per-kernel breakdown | done — `profiler.ts` on timestamp queries |
-| **decode >= 4x the M3 baseline** | **NOT MET — 97.7-100.6 tok/s against 100 needed. See B3** |
+| **decode >= 4x the M3 baseline** | **passed — 143.2 tok/s against 100 needed, 5.73x the baseline. See B3, now closed** |
 
 **Size.** 942 MiB -> **265 MiB** (3.55x), 30 chunks -> 9.
 
@@ -437,10 +437,18 @@ only lists the wins is a sales pitch, not a record.
 | fuse gate_proj + up_proj + silu | `swiglu_q4` | 93.8 | 100.6 | one activation read for both projections, 72 dispatches/token -> 24 |
 | rows-per-workgroup chosen per matmul | `matvec_q4` | 93.8 | 72.1 | **reverted** — the heuristic picked 1 row/workgroup for 896-row matrices, making the reduction tree deeper than the work each lane does |
 | sweep the workgroup shape | `matvec_q4`, `swiglu_q4` | — | **101.6** | wg=64/rows=8; see below |
+| pool the per-dispatch uniform buffers | whole pass (CPU side) | 102.3 | **145.5** | **the change that closed B3** — see below |
+| `vec4<f32>` activation loads + `dot()` in place of eight scalar loads | `matvec_q4`, `swiglu_q4` | 102.3 | 102.3 | **reverted** — no effect on the shipping shape; the backend was already coalescing the scalar loads |
+| top-k readback instead of the full logit vector | sampling | 101.1 | 99.3 | **not adopted for decode speed** — 607,744 B/token -> 72 B/token changes nothing, because both paths sync once per step regardless. It stays in for M4's reason, which is traffic, not latency |
 
-**Final: 97.7 / 98.2 / 100.6 tok/s** across three runs of the gate (best of 5, single model
-resident), and **101.6 tok/s** from the bench (best of 3). Effective bandwidth 28.0 GB/s
-against fp16's 30.4. The gate needs 100, so it lands on the line -- which is B3.
+**After the kernel work: 97.7 / 98.2 / 100.6 tok/s** across three runs of the gate, and
+101.6 tok/s from the bench. Effective bandwidth 28.0 GB/s against fp16's 30.4. The gate
+needs 100, so it landed on the line -- which was B3.
+
+**Final: 143.2 tok/s** in the full suite, 39.8 GB/s effective, after the last two rows of
+the table above. Neither is a kernel change, and the last kernel idea tried (vec4
+activation loads) was worth exactly nothing. The remaining time was on the CPU, in the
+encoder. See B3.
 
 #### What the profiler found, which no amount of staring would have
 
@@ -534,37 +542,51 @@ The M5 rows are in their own table above, with the reverted changes included.
 
 ## Blockers
 
-**B3 — the M5 decode gate is NOT reliably met. This blocks M6.**
+**B3 — CLOSED 2026-08-20. The M5 decode gate passes: 143.2 tok/s, 5.73x the M3 baseline.**
 
 The gate is "decode throughput at least 4x the M3 baseline". M3 recorded 23.98-26.56 tok/s
 and documented it as ~24-26; taking 25 as the baseline, the gate is 100 tok/s.
 
-Four runs of the gate test measured **97.7, 98.2, 100.6 tok/s in isolation and a failure
-inside the full suite**, where the earlier test files leave the GPU warm and memory under
-pressure. Against the ends of the recorded M3 spread the ratio is **3.78x to 4.19x**.
+It was previously 97.7-100.6 tok/s: on the line, and recorded as a miss rather than passed
+by picking a favourable run. It is now **143.2 tok/s in the full suite**, 5.73x the
+baseline and **5.38x-5.97x against both ends of the recorded M3 spread**, so the result no
+longer depends on which baseline is chosen. Against the current fp16 path it is 4.10-4.70x,
+and that stricter comparison clears 4x too. Effective bandwidth 27.2 -> 39.8 GB/s.
 
-So: decode is *about* 4x the M3 baseline, and sometimes a little under. Calling that a pass
-would mean choosing the run and the baseline that clear it, so it is recorded as a miss.
-The remaining gap is roughly 3%.
+**The missing time was not in a kernel.** All three next steps listed here previously
+assumed it was, and the first of them was tried and found to be worth nothing: replacing
+the eight scalar activation loads in `matvec_q4`/`swiglu_q4` with `vec4<f32>` loads and
+`dot()` measured 102.3 -> 102.3 tok/s, because the Metal backend was already coalescing
+them. That change is reverted and sits in the optimization log as a measured non-result.
 
-Against the *current* fp16 path the ratio is only 3.2x, because fp16 also benefits from the
-RMSNorm rewrite and the workgroup sweep — that comparison is stricter than the gate asks
-for and is reported alongside it.
+What actually cost the time was the CPU, and a stat had to be added to see it. Decode
+encodes ~411 dispatches per token and the pass built **a fresh GPUBuffer for every one of
+their uniform blocks**, then destroyed all 411 after the readback. Encoding is serial with
+the GPU -- the device is idle throughout -- so it came straight off the token time. The new
+`ForwardResult.encodeMs` put a number on it: **1.36 ms of a 9.76 ms token**, invisible in
+timestamp queries because none of it is GPU work.
 
-What was tried, in order, with numbers in the optimization log above: naive int4 port,
-vec4 loads, lane-partitioned rows, RMSNorm workgroup reduction, activation staging
-(reverted), fused SwiGLU, per-matmul row selection (reverted), and a 16-point workgroup
-sweep. Effective bandwidth went from 14.3 to 27.2 GB/s.
+Pooling those buffers by dispatch site and refilling them with `queue.writeBuffer` took
+decode from 102.3 to 145.5 tok/s. Note the step fell by 2.9 ms while encode fell by only
+0.6 ms: the other ~2.3 ms was the 411 `destroy()` calls, which ran *after* the readback and
+so were never inside the encode window at all.
 
-What I would try next, roughly in expected order of payoff:
-1. **f16 arithmetic** (`shader-f16` is available here). Activations are f32 and are read
-   once per lane group; halving that traffic is the largest untouched item. Needs an f32
-   fallback path, which is why it was not attempted inside this session's budget.
-2. **Fuse RMSNorm into the following projection**, removing 48 dispatches and a full
-   round trip of the normalised activations through global memory.
-3. **`down_proj`** is 16-25% of decode and its 896 output rows launch only 112 workgroups.
-   Splitting its reduction across workgroups with an atomic or two-stage combine would
-   raise occupancy; the naive per-matmul row heuristic that was tried is *not* this.
+**Two things worth keeping from how this went wrong.** The profiler that made M5's biggest
+kernel win possible -- finding RMSNorm at 56% of decode -- also framed the problem as a
+kernel problem for the rest of the milestone, because it can only see work that reaches the
+GPU. And the readback was the obvious suspect: the gate reads the full 151,936-float logit
+vector every step (607,744 B) while the chat path reads 72 B via M4's top-k. Measuring it
+head to head, the top-k path is **not faster** (99.3 vs 101.1 tok/s) -- both sync once per
+step regardless, so the traffic never mattered to latency. M4's top-k stays in for the
+reason it was built, which is traffic, not speed. Both results are in the optimization log.
+
+Still untried, and no longer needed for the gate, but the honest next items for M6:
+1. **Cache the bind groups too.** Pooling fixed the uniform buffers; a bind group is still
+   constructed per dispatch per token. Encode is now 0.73 ms of a 6.88 ms token, so the
+   ceiling here is around 10%.
+2. **f16 arithmetic** (`shader-f16` is available here), with the f32 fallback path.
+3. **Fuse RMSNorm into the following projection**, removing 48 dispatches per token.
+
 
 B1 and B2 remain closed.
 
@@ -671,6 +693,16 @@ download. That is the M5 quantization case making itself, not a problem with M1.
 - **Never conclude an optimization from one sample.** Run-to-run spread here is the same
   size as the effects being measured; two M5 changes were misread that way before the
   best-of-N harness existed.
+- **Uniform buffers are pooled per dispatch site and reused across steps**
+  (`ForwardPass.pooledUniform`). Slot `i` belongs to the `i`th `uniform()` call of a step,
+  which is why the dispatch sequence has to stay deterministic for a given step shape. If
+  you add a dispatch inside a conditional, the sites after it shift by one -- harmless,
+  since every slot is refilled with `writeBuffer` before use and grows if a later shape
+  needs it bigger, but it is why slots are keyed by order rather than by label.
+- **`ForwardResult.encodeMs` is the CPU half of a step**, up to and including `submit`.
+  Timestamp queries cannot see it, and on decode it was 14% of the token before the pooling
+  change. When decode looks slower than the kernel timings explain, read this first --
+  that gap is what B3 turned out to be.
 - `vite build` sets `copyPublicDir: false`. The weights live in `public/` so the dev
   server and test runner can serve them over HTTP, but copying a gigabyte into `dist/` on
   every build would be pointless. How weights reach the CDN is an M6 decision.
