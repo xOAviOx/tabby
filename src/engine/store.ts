@@ -91,6 +91,122 @@ export function isOpfsAvailable(): boolean {
 }
 
 /**
+ * The subset of `FileSystemWritableFileStream` the loader uses. Naming it lets the Safari
+ * fallback stand in for the real stream without the download path knowing which it has.
+ */
+export interface ChunkWritable {
+  seek(position: number): Promise<void>;
+  write(data: BufferSource): Promise<void>;
+  close(): Promise<void>;
+  abort(): Promise<void>;
+}
+
+let writableProbe: Promise<boolean> | null = null;
+
+/**
+ * Whether `createWritable()` actually *works*, rather than merely existing.
+ *
+ * Presence is not a usable signal. Safari exposes the method and then throws
+ * `UnknownError: The operation failed for an unknown transient reason` the moment the
+ * stream is written -- which is how a deployed build reached Safari, downloaded the whole
+ * model, and failed at the cache write. So the capability is probed by writing one byte
+ * to a scratch file, and the answer is cached for the life of the page.
+ *
+ * The probe is deliberately a write and not an open: opening succeeds on Safari too.
+ */
+export function createWritableUsable(dir: FileSystemDirectoryHandle): Promise<boolean> {
+  writableProbe ??= (async () => {
+    if (typeof FileSystemFileHandle === 'undefined') return false;
+    if (typeof FileSystemFileHandle.prototype.createWritable !== 'function') return false;
+    const name = '.createwritable-probe';
+    try {
+      const handle = await dir.getFileHandle(name, { create: true });
+      const writable = await handle.createWritable();
+      await writable.write(new Uint8Array([0]));
+      await writable.close();
+      return true;
+    } catch {
+      return false;
+    } finally {
+      await dir.removeEntry(name).catch(() => undefined);
+    }
+  })();
+  return writableProbe;
+}
+
+/** Re-run the capability probe. For tests that simulate another browser. */
+export function resetWritableProbe(): void {
+  writableProbe = null;
+}
+
+/**
+ * A `ChunkWritable` backed by the OPFS writer worker.
+ *
+ * Every operation is awaited round-trip rather than pipelined. The download path already
+ * awaits each write before pulling the next packet, so there is no throughput left on the
+ * table, and serialising keeps the worker's single sync handle unambiguous.
+ */
+async function openSyncAccessWritable(
+  handle: FileSystemFileHandle,
+  keepExistingData: boolean,
+): Promise<ChunkWritable> {
+  const worker = new Worker(new URL('./opfs-writer.worker.ts', import.meta.url), {
+    type: 'module',
+  });
+
+  let nextId = 1;
+  const send = (message: Record<string, unknown>, transfer: Transferable[] = []): Promise<void> => {
+    const id = nextId++;
+    return new Promise((resolve, reject) => {
+      const onMessage = (event: MessageEvent): void => {
+        if (event.data?.id !== id) return;
+        worker.removeEventListener('message', onMessage);
+        if (event.data.ok) resolve();
+        else reject(new ModelStoreError(`opfs worker: ${event.data.error}`));
+      };
+      worker.addEventListener('message', onMessage);
+      worker.postMessage({ ...message, id }, transfer);
+    });
+  };
+
+  const terminate = (): void => worker.terminate();
+
+  try {
+    await send({ op: 'open', handle, keepExistingData });
+  } catch (error) {
+    terminate();
+    throw error;
+  }
+
+  return {
+    seek: (position) => send({ op: 'seek', position }),
+    write: async (data) => {
+      // The worker needs its own copy: the caller reuses stream buffers, and a transferred
+      // ArrayBuffer would be detached out from under it.
+      const view = ArrayBuffer.isView(data)
+        ? new Uint8Array(data.buffer, data.byteOffset, data.byteLength)
+        : new Uint8Array(data);
+      const buffer = view.slice().buffer;
+      await send({ op: 'write', buffer }, [buffer]);
+    },
+    close: async () => {
+      try {
+        await send({ op: 'close' });
+      } finally {
+        terminate();
+      }
+    },
+    abort: async () => {
+      try {
+        await send({ op: 'abort' });
+      } finally {
+        terminate();
+      }
+    },
+  };
+}
+
+/**
  * OPFS-backed store for one model's chunk files.
  *
  * Uses `createWritable()` rather than `createSyncAccessHandle()`: the sync handle is
@@ -118,6 +234,11 @@ export class ModelStore {
     const models = await root.getDirectoryHandle('models', { create: true });
     const dir = await models.getDirectoryHandle(modelId, { create: true });
     return new ModelStore(dir, modelId);
+  }
+
+  /** The OPFS directory backing this model. Exposed for the write-capability probe. */
+  get directory(): FileSystemDirectoryHandle {
+    return this.dir;
   }
 
   private invalidate(name: string): void {
@@ -159,15 +280,25 @@ export class ModelStore {
   /**
    * Open a stream for writing. The caller must close it. `keepExistingData` triggers a
    * full copy of the current contents, so pass it only when actually resuming.
+   *
+   * Two implementations, chosen by what the browser can actually do -- see
+   * `createWritableUsable`, which probes rather than feature-detects. Chrome and Edge use
+   * `createWritable()` on the main thread. Safari has the method but throws when it is
+   * written, so there this falls back to a worker driving `createSyncAccessHandle()`,
+   * which is worker-only by specification.
    */
   async openWritable(
     name: string,
     options: { keepExistingData?: boolean } = {},
-  ): Promise<FileSystemWritableFileStream> {
+  ): Promise<ChunkWritable> {
     return opfs(`open ${name} for writing`, async () => {
       const handle = await this.dir.getFileHandle(name, { create: true });
       this.invalidate(name);
-      return handle.createWritable({ keepExistingData: options.keepExistingData ?? false });
+      const keepExistingData = options.keepExistingData ?? false;
+      if (await createWritableUsable(this.dir)) {
+        return handle.createWritable({ keepExistingData });
+      }
+      return openSyncAccessWritable(handle, keepExistingData);
     });
   }
 
