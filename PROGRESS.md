@@ -1,6 +1,6 @@
 # PROGRESS
 
-## Current milestone: M4 — complete. M5 not started.
+## Current milestone: M5 — complete, but the throughput gate is **marginal**. See Blockers (B3).
 
 ## Device limits negotiated on Apple M-series (`apple` / `metal-3`), Chromium 151 headless
 
@@ -397,6 +397,79 @@ and asserting on it would have been testing the model rather than the engine. Th
 checks what is actually ours to guarantee: that changing the system message changes the
 output under greedy decoding. Exact template rendering is gated separately, against HF.
 
+### M5 — met, marginally, 2026-08-20
+
+`npm test` -> 105 passed. The decode-throughput gate passes, but *only just*, and it does
+not pass on every run — see B3. Recorded honestly rather than as a clean tick.
+
+| gate | result |
+|---|---|
+| int4 block quantization in `convert.py` | done — block 32, one f16 scale, 8 nibbles per u32, int8 selectable |
+| quantized matvec dequantizing in-register | done — weights are never materialised as f16 |
+| quality vs PyTorch / fp16 | done — 92.5% top-1 agreement over 200 held-out steps |
+| perf panel with per-kernel breakdown | done — `profiler.ts` on timestamp queries |
+| **decode >= 4x the M3 baseline** | **100.6 tok/s vs 100 needed — 4.02x, but see B3** |
+
+**Size.** 942 MiB -> **265 MiB** (3.55x), 30 chunks -> 9.
+
+**Quality.** Worst relative dequantization error 9.6%; **top-1 agreement with the fp16 path
+is 185/200 = 92.5%** over held-out prose, both models fed the same tokens so the two do not
+simply drift apart. Against the PyTorch goldens: top-1 matches on 2 of 3 prompts, mean
+top-5 overlap 3.7/5. The one top-1 disagreement is a genuine near-tie — the fp16 gap
+between "2" and "The" for *what is 2 + 2?* is 0.96 logits, and both are plausible openings.
+On the `plain` prompt the fp16 model's own ranks 2-5 are near-identical filler tokens, so
+int4 reshuffling them is not evidence of anything.
+
+## The M5 optimization log
+
+Every row measured on this machine, int4 Qwen2.5-0.5B, decode only. **Two of the six
+changes made things worse and were reverted** — they are in the table because a table that
+only lists the wins is a sales pitch, not a record.
+
+| change | kernel | tok/s before | tok/s after | notes |
+|---|---|---|---|---|
+| int4 block quantization, naive port of the f16 matvec | `matvec_q4` | 26.3 (fp16) | 51.5 | 3.55x less data but only 1.9x faster: 14.3 GB/s against fp16's 26.0 |
+| `vec4<u32>` loads + lanes partitioned across rows | `matvec_q4` | 51.5 | 57.9 | one vec4 = one 32-weight block = one scale load |
+| **RMSNorm workgroup reduction** | `rmsnorm` | 57.9 | **86.5** | the largest single win; see below |
+| stage activations in workgroup memory | `matvec_q4` | 86.5 | 84.5 | **reverted** — activations are already cache-resident, the barriers cost more than the global reads saved |
+| fuse gate_proj + up_proj + silu | `swiglu_q4` | 93.8 | 100.6 | one activation read for both projections, 72 dispatches/token -> 24 |
+| rows-per-workgroup chosen per matmul | `matvec_q4` | 93.8 | 72.1 | **reverted** — the heuristic picked 1 row/workgroup for 896-row matrices, making the reduction tree deeper than the work each lane does |
+| sweep the workgroup shape | `matvec_q4`, `swiglu_q4` | — | **101.6** | wg=64/rows=8; see below |
+
+**Final: 97.7 / 98.2 / 100.6 tok/s** across three runs of the gate (best of 5, single model
+resident), and **101.6 tok/s** from the bench (best of 3). Effective bandwidth 28.0 GB/s
+against fp16's 30.4. The gate needs 100, so it lands on the line -- which is B3.
+
+#### What the profiler found, which no amount of staring would have
+
+Before any of this, a profiled decode step said:
+
+```
+  lm_head        1 calls   1.124 ms    8.5%
+  L6.post_norm   1 calls   0.163 ms    1.2%
+  L9.post_norm   1 calls   0.158 ms    1.2%
+  ... 46 more RMSNorm dispatches at ~0.155 ms each
+```
+
+**RMSNorm was ~56% of decode time.** The M2 kernel used one *invocation* per row, which is
+fine for prefill and pathological for decode: with a single token, one thread walked 896
+elements twice while the rest of the GPU idled. Rewriting it as a workgroup reduction moved
+decode from 57.9 to 86.5 tok/s in one change, and it was invisible in the tok/s number
+alone — it only showed up once each dispatch was timed separately.
+
+Everything after that is the matvecs, which is the right shape: `swiglu` 30.8%, `lm_head`
+17.3%, `down_proj` 16.7%.
+
+#### On measuring
+
+Three times a single-sample A/B pointed the wrong way. The fused SwiGLU looked like a 4%
+*regression* on one sample and is a 7% improvement over best-of-five; run-to-run spread on
+this machine is comparable to the effects being measured. Every row above is best-of-N,
+and the two reverted rows were only identified as regressions because of it.
+
+The sweep also rediscovers blocker B2 on every run: `rows=2` fails with
+`lm_head: dispatch (75968, 1, 1) exceeds maxComputeWorkgroupsPerDimension 65535`.
+
 ## The M2 bug that mattered: the reference was wrong, not the engine
 
 Gate (d) failed on the first run. Our greedy output forked from PyTorch at token 4 — ours
@@ -455,9 +528,40 @@ The table proper begins at M5. Two M3 changes belong in it, since both were meas
 | tiled prefill, 4 positions/workgroup, shared-memory activation tile | `matmul_f16_tiled` | 121 tok/s prefill | 344 tok/s | 96-token prompt, best of 3; logits bit-identical |
 | GPU top-k instead of full-logit readback | `topk_partial` + `topk_select` | 607,744 B/token | 328 B/token (16 B greedy) | 1853x less GPU->CPU traffic; top-k exact |
 
+The M5 rows are in their own table above, with the reverted changes included.
+
 ## Blockers
 
-None. B1 and B2 are both closed.
+**B3 — the M5 decode gate is met marginally and is not reliably reproducible.**
+
+The gate is "decode throughput at least 4x the M3 baseline". M3 recorded 23.98-26.56 tok/s
+and documented it as ~24-26; taking 25 as the baseline, the gate is 100 tok/s.
+
+Three runs of the gate test measured **97.7, 98.2 and 100.6 tok/s**. It passes on some runs
+and fails on others. Against the ends of the recorded M3 spread the ratio is **3.78x to
+4.19x**. I am flagging this rather than picking the run and the baseline that clear it:
+the honest statement is that decode is *about* 4x the M3 baseline, not comfortably past it.
+
+Against the *current* fp16 path the ratio is only 3.2x, because fp16 also benefits from the
+RMSNorm rewrite and the workgroup sweep — that comparison is stricter than the gate asks
+for and is reported alongside it.
+
+What was tried, in order, with numbers in the optimization log above: naive int4 port,
+vec4 loads, lane-partitioned rows, RMSNorm workgroup reduction, activation staging
+(reverted), fused SwiGLU, per-matmul row selection (reverted), and a 16-point workgroup
+sweep. Effective bandwidth went from 14.3 to 27.2 GB/s.
+
+What I would try next, roughly in expected order of payoff:
+1. **f16 arithmetic** (`shader-f16` is available here). Activations are f32 and are read
+   once per lane group; halving that traffic is the largest untouched item. Needs an f32
+   fallback path, which is why it was not attempted inside this session's budget.
+2. **Fuse RMSNorm into the following projection**, removing 48 dispatches and a full
+   round trip of the normalised activations through global memory.
+3. **`down_proj`** is 16-25% of decode and its 896 output rows launch only 112 workgroups.
+   Splitting its reduction across workgroups with an atomic or two-stage combine would
+   raise occupancy; the naive per-matmul row heuristic that was tried is *not* this.
+
+B1 and B2 remain closed.
 
 **B1 — CLOSED.** Tensor sharding could not be validated on this machine, whose
 `maxStorageBufferBindingSize` is 4 GiB. Fixed as planned: `loadModel` takes an optional
@@ -556,6 +660,12 @@ download. That is the M5 quantization case making itself, not a problem with M1.
   way. Silent approximation there produces prompts the model never saw in training.
 - **`MAX_TOP_K` (64) sizes the sample-output block**, and `topK` above it is rejected. If
   M5 wants a bigger pool, grow the buffer with it.
+- **Benchmarks live in `tests/*.bench.test.ts` and run with `npm run bench`**, under
+  `vitest.bench.config.ts`. They are excluded from `npm test`. Do not merge that config
+  with the main one -- `mergeConfig` unions `include` and runs the whole suite.
+- **Never conclude an optimization from one sample.** Run-to-run spread here is the same
+  size as the effects being measured; two M5 changes were misread that way before the
+  best-of-N harness existed.
 - `vite build` sets `copyPublicDir: false`. The weights live in `public/` so the dev
   server and test runner can serve them over HTTP, but copying a gigabyte into `dist/` on
   every build would be pointless. How weights reach the CDN is an M6 decision.
