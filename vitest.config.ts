@@ -15,6 +15,9 @@ export default defineConfig({
   publicDir: 'public',
   test: {
     include: ['tests/**/*.test.ts'],
+    // Benchmarks are the M5 evidence, not gates: they sweep configurations and take
+    // minutes. Run them with `npm run bench`.
+    exclude: ['tests/**/*.bench.test.ts', 'node_modules/**'],
     // One test file at a time. Files share a browser origin, so they share one OPFS
     // quota (4 GiB in an ephemeral Playwright context); running the ~1 GB Qwen gate
     // concurrently with the other files intermittently blew it. They also each create
